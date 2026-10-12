@@ -1,22 +1,84 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
-const shifts = [
-  { day: "MON", date: "12", name: "Amara Okafor", role: "Front Desk", start: "08:00", end: "16:00", color: "bg-emerald-100 text-emerald-800" },
-  { day: "TUE", date: "13", name: "Daniel James", role: "Operations", start: "09:00", end: "17:00", color: "bg-blue-100 text-blue-800" },
-  { day: "WED", date: "14", name: "Sarah Bello", role: "Customer Support", start: "08:00", end: "16:00", color: "bg-violet-100 text-violet-800" },
-  { day: "THU", date: "15", name: "David Musa", role: "Front Desk", start: "10:00", end: "18:00", color: "bg-amber-100 text-amber-800" },
-  { day: "FRI", date: "16", name: "Amara Okafor", role: "Front Desk", start: "08:00", end: "16:00", color: "bg-emerald-100 text-emerald-800" },
+type ApiShift = {
+  id: number;
+  employee_name: string;
+  role: string;
+  shift_day: string;
+  created_at: string;
+};
+
+type ScheduleShift = {
+  id: number;
+  day: string;
+  date: string;
+  name: string;
+  role: string;
+  start: string;
+  end: string;
+  color: string;
+  shiftDay: string;
+};
+
+const shiftColors = [
+  "bg-emerald-100 text-emerald-800",
+  "bg-blue-100 text-blue-800",
+  "bg-violet-100 text-violet-800",
+  "bg-amber-100 text-amber-800",
+  "bg-rose-100 text-rose-800",
 ];
+
+function formatShiftDate(dateString: string) {
+  const date = dateString.slice(0, 10);
+  const [year, month, day] = date.split("-").map(Number);
+  const localDate = new Date(year, month - 1, day);
+
+  return {
+    day: localDate
+      .toLocaleDateString("en-US", { weekday: "short" })
+      .toUpperCase(),
+    date: String(day),
+    shiftDay: date,
+  };
+}
+
+function mapApiShift(shift: ApiShift, index: number): ScheduleShift {
+  const formatted = formatShiftDate(shift.shift_day);
+
+  return {
+    id: shift.id,
+    ...formatted,
+    name: shift.employee_name,
+    role: shift.role,
+    start: "09:00",
+    end: "17:00",
+    color: shiftColors[index % shiftColors.length],
+  };
+}
+
+function getInitials(name: string) {
+  return name
+    .trim()
+    .split(/\s+/)
+    .map((part) => part[0])
+    .join("")
+    .slice(0, 2)
+    .toUpperCase();
+}
 
 export default function Home() {
   const [activeTab, setActiveTab] = useState("Overview");
   const [showForm, setShowForm] = useState(false);
   const [employee, setEmployee] = useState("");
   const [role, setRole] = useState("Front Desk");
-  const [day, setDay] = useState("MON");
+  const [day, setDay] = useState("2026-10-12");
   const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [schedule, setSchedule] = useState<ScheduleShift[]>([]);
 
   const [team, setTeam] = useState([
     { name: "Amara Okafor", role: "Front Desk", status: "On shift", initials: "AO" },
@@ -25,38 +87,89 @@ export default function Home() {
     { name: "David Musa", role: "Front Desk", status: "Off duty", initials: "DM" },
   ]);
 
-  const [schedule, setSchedule] = useState(shifts);
+  const loadShifts = useCallback(async () => {
+    setLoading(true);
+    setError("");
 
-  function addShift(e: React.FormEvent<HTMLFormElement>) {
+    try {
+      const response = await fetch("/api/shifts");
+      if (!response.ok) throw new Error("Unable to load shifts.");
+
+      const data: ApiShift[] = await response.json();
+      setSchedule(data.map(mapApiShift));
+    } catch {
+      setError("Could not load shifts. Check your connection and try again.");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadShifts();
+  }, [loadShifts]);
+
+  async function addShift(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    if (!employee.trim()) return;
 
-    const initials = employee.trim().split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase();
+    if (!employee.trim() || !day || saving) return;
 
-    setTeam((current) => current.some((member) => member.name === employee.trim())
-      ? current
-      : [...current, { name: employee.trim(), role, status: "Upcoming", initials }]);
+    setSaving(true);
+    setError("");
+    setNotice("");
 
-    const days: Record<string, string> = { MON: "12", TUE: "13", WED: "14", THU: "15", FRI: "16", SAT: "17", SUN: "18" };
+    try {
+      const response = await fetch("/api/shifts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          employeeName: employee.trim(),
+          role,
+          shiftDay: day,
+        }),
+      });
 
-    setSchedule((current) => [...current, {
-      day,
-      date: days[day],
-      name: employee.trim(),
-      role,
-      start: "09:00",
-      end: "17:00",
-      color: "bg-rose-100 text-rose-800",
-    }]);
+      const result = await response.json();
 
-    setNotice(`Shift added for ${employee.trim()} on ${day}.`);
-    setEmployee("");
-    setShowForm(false);
+      if (!response.ok) {
+        throw new Error(result.error || "Unable to save the shift.");
+      }
+
+      const savedShift = mapApiShift(result as ApiShift, schedule.length);
+
+      setSchedule((current) =>
+        [...current, savedShift].sort((a, b) =>
+          a.shiftDay.localeCompare(b.shiftDay) || a.id - b.id
+        )
+      );
+
+      setTeam((current) =>
+        current.some((member) => member.name === employee.trim())
+          ? current
+          : [
+              ...current,
+              {
+                name: employee.trim(),
+                role,
+                status: "Upcoming",
+                initials: getInitials(employee),
+              },
+            ]
+      );
+
+      setNotice(`Shift saved for ${employee.trim()} on ${day}.`);
+      setEmployee("");
+      setShowForm(false);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Unable to save the shift."
+      );
+    } finally {
+      setSaving(false);
+    }
   }
 
-  const visibleSchedule = activeTab === "Schedule"
-    ? schedule
-    : schedule.slice(0, 5);
+  const visibleSchedule =
+    activeTab === "Schedule" ? schedule : schedule.slice(0, 5);
 
   return (
     <main className="min-h-screen bg-[#f7f8f5] text-slate-900">
@@ -94,7 +207,7 @@ export default function Home() {
               <p className="text-xs font-medium text-slate-500">WORKSPACE / ROTA</p>
               <h1 className="mt-1 text-xl font-bold sm:text-2xl">{activeTab}</h1>
             </div>
-            <button onClick={() => { setShowForm(true); setNotice(""); }}
+            <button onClick={() => { setShowForm(true); setNotice(""); setError(""); }}
               className="rounded-xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-700">
               + Add shift
             </button>
@@ -102,6 +215,12 @@ export default function Home() {
 
           <div className="p-5 sm:p-8">
             {notice && <div role="status" className="mb-5 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800">{notice}</div>}
+            {error && (
+              <div role="alert" className="mb-5 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+                {error}
+                <button onClick={() => void loadShifts()} className="ml-3 font-semibold underline">Retry</button>
+              </div>
+            )}
 
             {activeTab === "Team" ? (
               <div>
@@ -124,12 +243,12 @@ export default function Home() {
                   <article className="rounded-2xl border border-slate-200 bg-white p-5">
                     <p className="text-sm text-slate-500">Scheduled shifts</p>
                     <p className="mt-3 text-3xl font-bold">{schedule.length}</p>
-                    <p className="mt-2 text-xs text-emerald-700">Across the current plan</p>
+                    <p className="mt-2 text-xs text-emerald-700">Saved in the database</p>
                   </article>
                   <article className="rounded-2xl border border-slate-200 bg-white p-5">
                     <p className="text-sm text-slate-500">Team members</p>
                     <p className="mt-3 text-3xl font-bold">{team.length}</p>
-                    <p className="mt-2 text-xs text-slate-500">In this workspace preview</p>
+                    <p className="mt-2 text-xs text-slate-500">In this workspace</p>
                   </article>
                   <article className="rounded-2xl bg-lime-200 p-5">
                     <p className="text-sm text-slate-700">Planning tip</p>
@@ -142,7 +261,7 @@ export default function Home() {
                   <div>
                     <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">Your workspace</p>
                     <h2 className="mt-2 text-2xl font-bold">Weekly schedule</h2>
-                    <p className="mt-1 text-sm text-slate-500">Sample shifts for Monday–Friday, October 12–16.</p>
+                    <p className="mt-1 text-sm text-slate-500">Shifts retrieved from your database.</p>
                   </div>
                   <button onClick={() => setActiveTab(activeTab === "Schedule" ? "Overview" : "Schedule")}
                     className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold hover:bg-slate-50">
@@ -150,25 +269,31 @@ export default function Home() {
                   </button>
                 </div>
 
-                <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-                  {visibleSchedule.map((shift, index) => (
-                    <article key={`${shift.name}-${shift.day}-${index}`} className="rounded-2xl border border-slate-200 bg-white p-5 transition hover:-translate-y-0.5 hover:shadow-sm">
-                      <div className="flex items-start justify-between">
-                        <div><p className="text-xs font-bold tracking-widest text-slate-400">{shift.day}</p><p className="mt-1 text-2xl font-bold">{shift.date}</p></div>
-                        <span className={`rounded-full px-3 py-1 text-xs font-semibold ${shift.color}`}>Scheduled</span>
-                      </div>
-                      <div className="my-5 h-px bg-slate-100" />
-                      <h3 className="font-semibold">{shift.name}</h3>
-                      <p className="mt-1 text-sm text-slate-500">{shift.role}</p>
-                      <p className="mt-4 text-sm font-semibold">{shift.start} – {shift.end}</p>
-                    </article>
-                  ))}
-                </div>
+                {loading ? (
+                  <p className="mt-5 rounded-xl border border-slate-200 bg-white p-6 text-sm text-slate-500">Loading shifts…</p>
+                ) : schedule.length === 0 ? (
+                  <p className="mt-5 rounded-xl border border-slate-200 bg-white p-6 text-sm text-slate-500">No shifts yet. Select “Add shift” to create your first one.</p>
+                ) : (
+                  <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                    {visibleSchedule.map((shift) => (
+                      <article key={shift.id} className="rounded-2xl border border-slate-200 bg-white p-5 transition hover:-translate-y-0.5 hover:shadow-sm">
+                        <div className="flex items-start justify-between">
+                          <div><p className="text-xs font-bold tracking-widest text-slate-400">{shift.day}</p><p className="mt-1 text-2xl font-bold">{shift.date}</p></div>
+                          <span className={`rounded-full px-3 py-1 text-xs font-semibold ${shift.color}`}>Scheduled</span>
+                        </div>
+                        <div className="my-5 h-px bg-slate-100" />
+                        <h3 className="font-semibold">{shift.name}</h3>
+                        <p className="mt-1 text-sm text-slate-500">{shift.role}</p>
+                        <p className="mt-4 text-sm font-semibold">{shift.start} – {shift.end}</p>
+                      </article>
+                    ))}
+                  </div>
+                )}
               </>
             )}
 
             <footer className="mt-12 border-t border-slate-200 py-6 text-xs text-slate-400">
-              Rota · Team scheduling workspace · Prototype with sample data
+              Rota · Team scheduling workspace · Connected to Neon PostgreSQL
             </footer>
           </div>
         </section>
@@ -178,20 +303,24 @@ export default function Home() {
         <div className="fixed inset-0 z-10 flex items-center justify-center bg-slate-950/40 p-4">
           <form onSubmit={addShift} className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl">
             <div className="mb-6 flex items-center justify-between">
-              <div><h2 className="text-xl font-bold">Add a shift</h2><p className="mt-1 text-sm text-slate-500">Add a team member to the sample rota.</p></div>
+              <div><h2 className="text-xl font-bold">Add a shift</h2><p className="mt-1 text-sm text-slate-500">Save a shift to your database.</p></div>
               <button type="button" onClick={() => setShowForm(false)} className="rounded-lg px-3 py-2 text-slate-500 hover:bg-slate-100" aria-label="Close">✕</button>
             </div>
+
             <label className="mb-2 block text-sm font-medium" htmlFor="employee">Team member name</label>
-            <input id="employee" required value={employee} onChange={(e) => setEmployee(e.target.value)} placeholder="e.g. Chika Nwosu" className="mb-4 w-full rounded-xl border border-slate-300 px-3 py-3 outline-none focus:border-lime-500" />
+            <input id="employee" required maxLength={100} value={employee} onChange={(e) => setEmployee(e.target.value)} placeholder="e.g. Chika Nwosu" className="mb-4 w-full rounded-xl border border-slate-300 px-3 py-3 outline-none focus:border-lime-500" />
+
             <label className="mb-2 block text-sm font-medium" htmlFor="role">Role</label>
             <select id="role" value={role} onChange={(e) => setRole(e.target.value)} className="mb-4 w-full rounded-xl border border-slate-300 bg-white px-3 py-3">
-              <option>Front Desk</option><option>Operations</option><option>Customer Support</option><option>Supervisor</option>
+              <option>Front Desk</option><option>Operations</option><option>Customer Support</option><option>Supervisor</option><option>Frontend Developer</option>
             </select>
-            <label className="mb-2 block text-sm font-medium" htmlFor="day">Day</label>
-            <select id="day" value={day} onChange={(e) => setDay(e.target.value)} className="mb-6 w-full rounded-xl border border-slate-300 bg-white px-3 py-3">
-              <option value="MON">Monday, October 12</option><option value="TUE">Tuesday, October 13</option><option value="WED">Wednesday, October 14</option><option value="THU">Thursday, October 15</option><option value="FRI">Friday, October 16</option><option value="SAT">Saturday, October 17</option><option value="SUN">Sunday, October 18</option>
-            </select>
-            <button type="submit" className="w-full rounded-xl bg-slate-900 px-4 py-3 font-semibold text-white hover:bg-slate-700">Save shift</button>
+
+            <label className="mb-2 block text-sm font-medium" htmlFor="day">Shift date</label>
+            <input id="day" type="date" required value={day} onChange={(e) => setDay(e.target.value)} className="mb-6 w-full rounded-xl border border-slate-300 bg-white px-3 py-3" />
+
+            <button type="submit" disabled={saving} className="w-full rounded-xl bg-slate-900 px-4 py-3 font-semibold text-white hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-60">
+              {saving ? "Saving…" : "Save shift"}
+            </button>
           </form>
         </div>
       )}
