@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Rota</string>
+    <string name="title_activity_main">Rota</string>
+    <string name="package_name">com.rota.app</string>
+    <string name="custom_url_scheme">com.rota.app</string>
+</resources>

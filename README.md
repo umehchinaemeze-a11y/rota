@@ -140,6 +140,7 @@ An Android mobile wrapper project is configured in `android/` using Capacitor (`
 * **Architecture:** The mobile app functions as a native Android WebView wrapper around the hosted web application.
 * **Server Connection:** In `capacitor.config.ts`, `server.url` is explicitly configured to `https://rota-lovat-gamma.vercel.app/` with `androidScheme: 'https'`.
 * **Network Dependency:** Because the Capacitor shell points directly to the hosted production URL, the Android application requires an active internet connection to load and operate. It does not bundle an offline SQLite/Room database or local Node.js runtime.
+* **Web Directory Placeholder:** `www/index.html` is a minimal placeholder retained to satisfy Capacitor CLI's web-directory requirement. The actual application UI and API are served from https://rota-lovat-gamma.vercel.app/, and the Android wrapper requires an internet connection.
 * **Scope Note:** Native Android interactive authentication and offline background caching are not verified as implemented.
 
 ---
