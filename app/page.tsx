@@ -1,73 +1,34 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { canManageShiftRecord } from "@/lib/permissions";
-
-type ApiShift = {
-  id: number;
-  employee_name: string;
-  role: string;
-  user_id?: number | null;
-  shift_day: string;
-  created_at: string;
-};
-
-type ScheduleShift = {
-  id: number;
-  day: string;
-  date: string;
-  name: string;
-  role: string;
-  userId?: number | null;
-  start: string;
-  end: string;
-  color: string;
-  shiftDay: string;
-};
+import Link from "next/link";
+import { canManageTeamShiftRecord, isManagerRole, APP_ROLES } from "@/lib/permissions";
+import {
+  resolveShiftFetchResponse,
+  mapApiShift,
+  type ApiShift,
+  type ScheduleShift,
+} from "@/lib/shifts-client";
 
 type AuthUser = {
   id: number;
   email: string;
   name: string;
   role: string;
+  teamId?: number | null;
 };
 
-const shiftColors = [
-  "bg-emerald-100 text-emerald-800",
-  "bg-blue-100 text-blue-800",
-  "bg-violet-100 text-violet-800",
-  "bg-amber-100 text-amber-800",
-  "bg-rose-100 text-rose-800",
-];
-
-function formatShiftDate(dateString: string) {
-  const date = dateString.slice(0, 10);
-  const [year, month, day] = date.split("-").map(Number);
-  const localDate = new Date(year, month - 1, day);
-
-  return {
-    day: localDate
-      .toLocaleDateString("en-US", { weekday: "short" })
-      .toUpperCase(),
-    date: String(day),
-    shiftDay: date,
-  };
-}
-
-function mapApiShift(shift: ApiShift, index: number): ScheduleShift {
-  const formatted = formatShiftDate(shift.shift_day);
-
-  return {
-    id: shift.id,
-    ...formatted,
-    name: shift.employee_name,
-    role: shift.role,
-    userId: shift.user_id,
-    start: "09:00",
-    end: "17:00",
-    color: shiftColors[index % shiftColors.length],
-  };
-}
+type ShiftSwapRequest = {
+  id: string;
+  shiftId: number;
+  shiftDay: string;
+  requesterName: string;
+  requesterRole: string;
+  targetEmployeeName: string;
+  reason: string;
+  status: "pending" | "approved" | "declined";
+  createdAt: string;
+};
 
 function getInitials(name: string) {
   return name
@@ -88,6 +49,7 @@ export default function Home() {
   const [showLoginModal, setShowLoginModal] = useState(false);
   const [loginEmail, setLoginEmail] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
+  const [showLoginPassword, setShowLoginPassword] = useState(false);
   const [loginError, setLoginError] = useState("");
   const [loggingIn, setLoggingIn] = useState(false);
 
@@ -95,6 +57,20 @@ export default function Home() {
   const [showForm, setShowForm] = useState(false);
   const [editingShift, setEditingShift] = useState<ScheduleShift | null>(null);
   const [deletingShift, setDeletingShift] = useState<ScheduleShift | null>(null);
+
+  // Shift Swap states
+  const [swapRequests, setSwapRequests] = useState<ShiftSwapRequest[]>([]);
+  const [swappingShift, setSwappingShift] = useState<ScheduleShift | null>(null);
+  const [swapTarget, setSwapTarget] = useState("");
+  const [swapReason, setSwapReason] = useState("");
+  const [submittingSwap, setSubmittingSwap] = useState(false);
+
+  // Workspace Settings & Team Invite states
+  const [notificationsEnabled, setNotificationsEnabled] = useState(true);
+  const [showInviteModal, setShowInviteModal] = useState(false);
+  const [inviteName, setInviteName] = useState("");
+  const [inviteRole, setInviteRole] = useState("Front Desk");
+  const [inviting, setInviting] = useState(false);
 
   // Form fields
   const [employee, setEmployee] = useState("");
@@ -107,6 +83,15 @@ export default function Home() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [shiftLoadStatus, setShiftLoadStatus] = useState<
+    "loading" | "success" | "unauthenticated" | "forbidden" | "network_error"
+  >("loading");
+  const [statusMessage, setStatusMessage] = useState("");
+
+  // Workspace onboarding states
+  const [newWorkspaceName, setNewWorkspaceName] = useState("");
+  const [creatingWorkspace, setCreatingWorkspace] = useState(false);
+  const [workspaceError, setWorkspaceError] = useState("");
 
   // Schedule & team
   const [schedule, setSchedule] = useState<ScheduleShift[]>([]);
@@ -145,12 +130,42 @@ export default function Home() {
 
     try {
       const response = await fetch("/api/shifts");
-      if (!response.ok) throw new Error("Unable to load shifts from the database.");
+      let body: unknown = null;
+      try {
+        body = await response.json();
+      } catch {
+        // Response may not contain JSON
+      }
 
-      const data: ApiShift[] = await response.json();
-      setSchedule(data.map(mapApiShift));
+      const outcome = resolveShiftFetchResponse(response.status, body);
+
+      if (outcome.status === "success") {
+        setSchedule(outcome.shifts);
+        setShiftLoadStatus("success");
+        setStatusMessage("");
+        setError("");
+      } else if (outcome.status === "unauthenticated") {
+        setSchedule([]);
+        setShiftLoadStatus("unauthenticated");
+        setStatusMessage(outcome.message);
+        setError(""); // Do not present 401 as a connection error
+      } else if (outcome.status === "forbidden") {
+        setSchedule([]);
+        setShiftLoadStatus("forbidden");
+        setStatusMessage(outcome.message);
+        setError(""); // Do not present 403 as a connection error
+      } else {
+        setSchedule([]);
+        setShiftLoadStatus("network_error");
+        setError(outcome.message);
+        setStatusMessage("");
+      }
     } catch {
-      setError("Could not load shifts. Check your connection and try again.");
+      const outcome = resolveShiftFetchResponse(0, null, true);
+      setSchedule([]);
+      setShiftLoadStatus("network_error");
+      setError(outcome.status !== "success" ? outcome.message : "Failed to load shifts.");
+      setStatusMessage("");
     } finally {
       setLoading(false);
     }
@@ -158,9 +173,20 @@ export default function Home() {
 
   // Load shifts only after the authentication state is known
   useEffect(() => {
-    void checkSession().then(() => {
-      void loadShifts();
-    });
+    let active = true;
+
+    async function initialize() {
+      await checkSession();
+      if (active) {
+        await loadShifts();
+      }
+    }
+
+    void initialize();
+
+    return () => {
+      active = false;
+    };
   }, [checkSession, loadShifts]);
 
   async function handleLogin(e: React.FormEvent<HTMLFormElement>) {
@@ -193,6 +219,49 @@ export default function Home() {
       setLoginError(err instanceof Error ? err.message : "Unable to sign in.");
     } finally {
       setLoggingIn(false);
+    }
+  }
+
+  async function handleCreateWorkspace(e: React.FormEvent) {
+    e.preventDefault();
+    const trimmed = newWorkspaceName.trim();
+    if (!trimmed || creatingWorkspace) return;
+
+    if (trimmed.length < 2) {
+      setWorkspaceError("Workspace name must be at least 2 characters.");
+      return;
+    }
+
+    setCreatingWorkspace(true);
+    setWorkspaceError("");
+    setError("");
+
+    try {
+      const res = await fetch("/api/teams", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: trimmed }),
+      });
+
+      const data = await res.json().catch(() => null);
+
+      if (!res.ok) {
+        throw new Error(data?.error || "Failed to create workspace. Please try again.");
+      }
+
+      setNotice(`Workspace "${data.team.name}" created! You are now the workspace Owner.`);
+      setNewWorkspaceName("");
+      const user = await checkSession();
+      if (user) {
+        setCurrentUser(user);
+      }
+      await loadShifts();
+    } catch (err: unknown) {
+      setWorkspaceError(
+        err instanceof Error ? err.message : "An unexpected error occurred while creating your workspace."
+      );
+    } finally {
+      setCreatingWorkspace(false);
     }
   }
 
@@ -233,9 +302,18 @@ export default function Home() {
       return;
     }
 
-    const hasPermission = canManageShiftRecord(
-      { userId: currentUser.id, role: currentUser.role },
-      { id: shift.id, user_id: shift.userId, employee_name: shift.name }
+    const hasPermission = canManageTeamShiftRecord(
+      {
+        userId: currentUser.id,
+        role: currentUser.role,
+        teamId: currentUser.teamId ?? null,
+      },
+      {
+        id: shift.id,
+        user_id: shift.userId,
+        employee_name: shift.name,
+        teamId: shift.teamId ?? null,
+      }
     );
 
     if (!hasPermission) {
@@ -262,9 +340,18 @@ export default function Home() {
       return;
     }
 
-    const hasPermission = canManageShiftRecord(
-      { userId: currentUser.id, role: currentUser.role },
-      { id: shift.id, user_id: shift.userId, employee_name: shift.name }
+    const hasPermission = canManageTeamShiftRecord(
+      {
+        userId: currentUser.id,
+        role: currentUser.role,
+        teamId: currentUser.teamId ?? null,
+      },
+      {
+        id: shift.id,
+        user_id: shift.userId,
+        employee_name: shift.name,
+        teamId: shift.teamId ?? null,
+      }
     );
 
     if (!hasPermission) {
@@ -275,6 +362,161 @@ export default function Home() {
     }
 
     setDeletingShift(shift);
+  }
+
+  function handleStartSwap(shift: ScheduleShift) {
+    setNotice("");
+    setError("");
+
+    if (!currentUser) {
+      setShowLoginModal(true);
+      setNotice("Please sign in to request a shift swap.");
+      return;
+    }
+
+    setSwappingShift(shift);
+    const candidate = team.find((m) => m.name !== shift.name);
+    setSwapTarget(candidate ? candidate.name : "");
+    setSwapReason("");
+  }
+
+  async function handleConfirmSwap(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!swappingShift || !swapTarget || submittingSwap) return;
+    setSubmittingSwap(true);
+
+    const isManager = isManagerRole(currentUser?.role);
+
+    if (isManager) {
+      try {
+        const targetMember = team.find((m) => m.name === swapTarget);
+        const response = await fetch(`/api/shifts/${swappingShift.id}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            employeeName: swapTarget,
+            role: targetMember ? targetMember.role : swappingShift.role,
+            shiftDay: swappingShift.shiftDay,
+          }),
+        });
+
+        const updated = await response.json();
+        if (!response.ok) {
+          throw new Error(updated.error || "Failed to execute shift swap.");
+        }
+
+        const mapped = mapApiShift(
+          updated,
+          schedule.findIndex((s) => s.id === swappingShift.id)
+        );
+        setSchedule((curr) =>
+          curr.map((s) => (s.id === mapped.id ? mapped : s))
+        );
+        setNotice(
+          `Shift swap approved and executed: Shift on ${swappingShift.shiftDay} assigned to ${swapTarget}.`
+        );
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Swap execution failed.");
+      }
+    } else {
+      const newRequest: ShiftSwapRequest = {
+        id: `swap-${Date.now()}`,
+        shiftId: swappingShift.id,
+        shiftDay: swappingShift.shiftDay,
+        requesterName: swappingShift.name,
+        requesterRole: swappingShift.role,
+        targetEmployeeName: swapTarget,
+        reason: swapReason.trim() || "Coverage requested",
+        status: "pending",
+        createdAt: new Date().toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+        }),
+      };
+      setSwapRequests((curr) => [newRequest, ...curr]);
+      setNotice(
+        `Swap request submitted for ${swappingShift.name} to swap with ${swapTarget}. Awaiting manager approval.`
+      );
+    }
+
+    setSwappingShift(null);
+    setSubmittingSwap(false);
+  }
+
+  async function handleApproveSwap(req: ShiftSwapRequest) {
+    try {
+      const shift = schedule.find((s) => s.id === req.shiftId);
+      if (!shift) throw new Error("Shift record no longer found.");
+
+      const targetMember = team.find((m) => m.name === req.targetEmployeeName);
+      const response = await fetch(`/api/shifts/${req.shiftId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          employeeName: req.targetEmployeeName,
+          role: targetMember ? targetMember.role : req.requesterRole,
+          shiftDay: req.shiftDay,
+        }),
+      });
+
+      const updated = await response.json();
+      if (!response.ok) {
+        throw new Error(updated.error || "Failed to approve swap.");
+      }
+
+      const mapped = mapApiShift(
+        updated,
+        schedule.findIndex((s) => s.id === req.shiftId)
+      );
+      setSchedule((curr) =>
+        curr.map((s) => (s.id === mapped.id ? mapped : s))
+      );
+      setSwapRequests((curr) =>
+        curr.map((r) => (r.id === req.id ? { ...r, status: "approved" } : r))
+      );
+      setNotice(
+        `Approved shift swap: ${req.requesterName} → ${req.targetEmployeeName} on ${req.shiftDay}.`
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not approve swap.");
+    }
+  }
+
+  function handleDeclineSwap(reqId: string) {
+    setSwapRequests((curr) =>
+      curr.map((r) => (r.id === reqId ? { ...r, status: "declined" } : r))
+    );
+    setNotice("Shift swap request was declined.");
+  }
+
+  function handleInviteMember(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!inviteName.trim() || inviting) return;
+    setInviting(true);
+
+    const trimmed = inviteName.trim();
+    if (team.some((m) => m.name.toLowerCase() === trimmed.toLowerCase())) {
+      setError(`Team member "${trimmed}" is already on this workspace roster.`);
+      setInviting(false);
+      return;
+    }
+
+    setTeam((curr) => [
+      ...curr,
+      {
+        name: trimmed,
+        role: inviteRole,
+        status: "Upcoming",
+        initials: getInitials(trimmed),
+      },
+    ]);
+
+    setNotice(
+      `Invitation sent to ${trimmed} (${inviteRole}). Member added to workspace roster.`
+    );
+    setShowInviteModal(false);
+    setInviteName("");
+    setInviting(false);
   }
 
   async function handleSaveShift(e: React.FormEvent<HTMLFormElement>) {
@@ -400,10 +642,7 @@ export default function Home() {
   const visibleSchedule =
     activeTab === "Schedule" ? schedule : schedule.slice(0, 6);
 
-  const isManager =
-    currentUser?.role === "Supervisor" ||
-    currentUser?.role === "Operations" ||
-    currentUser?.role === "Admin";
+  const isManager = isManagerRole(currentUser?.role);
 
   return (
     <main className="min-h-screen bg-[#f7f8f5] text-slate-900">
@@ -426,7 +665,7 @@ export default function Home() {
             Workspace
           </p>
           <nav className="space-y-2">
-            {["Overview", "Schedule", "Team"].map((tab) => (
+            {["Overview", "Schedule", "Team", "Settings"].map((tab) => (
               <button
                 key={tab}
                 onClick={() => {
@@ -440,7 +679,13 @@ export default function Home() {
                     : "text-slate-600 hover:bg-slate-100"
                 }`}
               >
-                {tab === "Overview" ? "◫" : tab === "Schedule" ? "▦" : "♙"}{" "}
+                {tab === "Overview"
+                  ? "◫"
+                  : tab === "Schedule"
+                  ? "▦"
+                  : tab === "Team"
+                  ? "♙"
+                  : "⚙"}{" "}
                 <span className="ml-3">{tab}</span>
               </button>
             ))}
@@ -554,8 +799,14 @@ export default function Home() {
                 <p className="text-xs font-bold uppercase tracking-widest text-slate-400">
                   Total shifts
                 </p>
-                <p className="mt-2 text-3xl font-bold">{schedule.length}</p>
-                <p className="mt-1 text-xs text-slate-500">Live database records</p>
+                <p className="mt-2 text-3xl font-bold">
+                  {shiftLoadStatus === "unauthenticated" ? "—" : schedule.length}
+                </p>
+                <p className="mt-1 text-xs text-slate-500">
+                  {shiftLoadStatus === "unauthenticated"
+                    ? "Sign in to view"
+                    : "Live database records"}
+                </p>
               </div>
               <div className="rounded-2xl border border-slate-200 bg-white p-5">
                 <p className="text-xs font-bold uppercase tracking-widest text-slate-400">
@@ -583,18 +834,29 @@ export default function Home() {
                 <p className="mt-1 text-xs text-slate-500">
                   {currentUser
                     ? `Authenticated as ${currentUser.name}`
-                    : "Read-only access"}
+                    : "Sign in required to view shifts"}
                 </p>
               </div>
             </div>
 
             {/* Team tab */}
             {activeTab === "Team" && (
-              <div className="mt-8 rounded-2xl border border-slate-200 bg-white p-6">
-                <h2 className="text-lg font-bold">Workspace Team Members</h2>
-                <p className="text-sm text-slate-500 mb-6">
-                  Team members with roles and live shift availability.
-                </p>
+              <div className="mt-8 rounded-2xl border border-slate-200 bg-white p-6 shadow-xs">
+                <div className="flex flex-wrap items-center justify-between gap-4 mb-6">
+                  <div>
+                    <h2 className="text-lg font-bold">Workspace Team Members</h2>
+                    <p className="text-sm text-slate-500">
+                      Active roster members with designated roles and live shift availability.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowInviteModal(true)}
+                    className="rounded-xl bg-slate-900 px-4 py-2 text-xs font-semibold text-white shadow-xs hover:bg-slate-800 transition"
+                  >
+                    + Invite Member
+                  </button>
+                </div>
                 <div className="divide-y divide-slate-100">
                   {team.map((member) => (
                     <div
@@ -627,9 +889,210 @@ export default function Home() {
               </div>
             )}
 
+            {/* Settings tab */}
+            {activeTab === "Settings" && (
+              <div className="mt-8 space-y-6">
+                <div className="rounded-2xl border border-slate-200 bg-white p-6 sm:p-8 shadow-xs">
+                  <h2 className="text-lg font-bold text-slate-900 mb-1">
+                    Workspace & User Settings
+                  </h2>
+                  <p className="text-sm text-slate-500 mb-6">
+                    Manage your account details, workspace role permissions, and session preferences.
+                  </p>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div className="rounded-xl border border-slate-100 bg-slate-50/70 p-5">
+                      <p className="text-xs font-bold uppercase tracking-wider text-slate-500 mb-3">
+                        Authenticated Profile
+                      </p>
+                      {currentUser ? (
+                        <div className="space-y-2 text-sm">
+                          <p>
+                            <span className="text-slate-500">Name:</span>{" "}
+                            <strong className="text-slate-900">{currentUser.name}</strong>
+                          </p>
+                          <p>
+                            <span className="text-slate-500">Email:</span>{" "}
+                            <strong className="text-slate-900">{currentUser.email}</strong>
+                          </p>
+                          <p>
+                            <span className="text-slate-500">Assigned Role:</span>{" "}
+                            <span className="rounded-md bg-lime-100 px-2 py-0.5 text-xs font-bold text-lime-800">
+                              {currentUser.role}
+                            </span>
+                          </p>
+                          <p>
+                            <span className="text-slate-500">User ID:</span>{" "}
+                            <code className="text-xs bg-slate-200 px-1.5 py-0.5 rounded font-mono">
+                              #{currentUser.id}
+                            </code>
+                          </p>
+                        </div>
+                      ) : (
+                        <p className="text-xs text-slate-500">
+                          Not signed in. Sign in to view and manage your profile settings.
+                        </p>
+                      )}
+                    </div>
+
+                    <div className="rounded-xl border border-slate-100 bg-slate-50/70 p-5">
+                      <p className="text-xs font-bold uppercase tracking-wider text-slate-500 mb-3">
+                        Workspace Security & Multi-Tenancy
+                      </p>
+                      <div className="space-y-2 text-sm text-slate-700">
+                        <p>
+                          <span className="text-slate-500">Workspace:</span>{" "}
+                          <strong>Operations Rota</strong>
+                        </p>
+                        <p>
+                          <span className="text-slate-500">Tenant ID:</span>{" "}
+                          <span className="font-mono text-xs">
+                            {currentUser?.teamId ?? "team-alpha (default)"}
+                          </span>
+                        </p>
+                        <p>
+                          <span className="text-slate-500">Session Security:</span>{" "}
+                          <span className="text-xs font-semibold text-emerald-700">
+                            HMAC-SHA256 Encrypted HttpOnly
+                          </span>
+                        </p>
+                        <p>
+                          <span className="text-slate-500">Database Role Revalidation:</span>{" "}
+                          <span className="text-xs text-slate-600">Active per request</span>
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="mt-6 border-t border-slate-100 pt-6">
+                    <h3 className="text-sm font-bold text-slate-900 mb-3">
+                      Role-Based Access Permissions
+                    </h3>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                      <div className="flex items-center gap-2 text-slate-700">
+                        <span className="text-emerald-600 font-bold">✓</span>
+                        View workspace shift calendar
+                      </div>
+                      <div className="flex items-center gap-2 text-slate-700">
+                        <span className="text-emerald-600 font-bold">✓</span>
+                        Schedule shifts assigned to own account
+                      </div>
+                      <div className="flex items-center gap-2 text-slate-700">
+                        <span className="text-emerald-600 font-bold">✓</span>
+                        Request shift swaps with colleagues
+                      </div>
+                      <div className="flex items-center gap-2 text-slate-700">
+                        {isManager ? (
+                          <>
+                            <span className="text-emerald-600 font-bold">✓</span>
+                            <span>Manage and reassign all team shifts (Manager authorized)</span>
+                          </>
+                        ) : (
+                          <>
+                            <span className="text-slate-400 font-bold">✕</span>
+                            <span className="text-slate-400">Manage colleague shifts (Manager role required)</span>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="mt-6 border-t border-slate-100 pt-6 flex flex-wrap items-center justify-between gap-4">
+                    <div className="flex items-center gap-3">
+                      <input
+                        id="notifications-toggle"
+                        type="checkbox"
+                        checked={notificationsEnabled}
+                        onChange={(e) => setNotificationsEnabled(e.target.checked)}
+                        className="h-4 w-4 rounded border-slate-300 text-slate-900 focus:ring-slate-900"
+                      />
+                      <label htmlFor="notifications-toggle" className="text-xs font-medium text-slate-700">
+                        In-app shift update notifications enabled
+                      </label>
+                    </div>
+
+                    {currentUser && (
+                      <button
+                        type="button"
+                        onClick={handleLogout}
+                        className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-2 text-xs font-semibold text-rose-700 hover:bg-rose-100 transition"
+                      >
+                        Sign Out of Session
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* Schedule & Overview tab */}
-            {activeTab !== "Team" && (
+            {activeTab !== "Team" && activeTab !== "Settings" && (
               <>
+                {/* Pending Shift Swap Requests */}
+                {swapRequests.length > 0 && (
+                  <div className="mt-8 rounded-2xl border border-amber-200 bg-amber-50/80 p-5 shadow-xs">
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="flex items-center gap-2">
+                        <span className="text-base select-none">🔄</span>
+                        <h3 className="text-sm font-bold text-amber-950">
+                          Shift Coverage & Swap Requests ({swapRequests.filter((r) => r.status === "pending").length} Pending)
+                        </h3>
+                      </div>
+                    </div>
+                    <div className="space-y-2">
+                      {swapRequests.map((req) => (
+                        <div
+                          key={req.id}
+                          className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200/70 bg-white p-3.5 text-xs text-slate-800 shadow-2xs"
+                        >
+                          <div>
+                            <p className="font-semibold text-slate-900">
+                              {req.requesterName} <span className="font-normal text-slate-500">requested swap with</span> {req.targetEmployeeName}
+                            </p>
+                            <p className="text-slate-500 mt-0.5">
+                              Shift: {req.shiftDay} · Note: &ldquo;{req.reason}&rdquo; · Requested at {req.createdAt}
+                            </p>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            {req.status === "pending" ? (
+                              isManager ? (
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleApproveSwap(req)}
+                                    className="rounded-lg bg-emerald-600 px-3 py-1 font-semibold text-white hover:bg-emerald-700 transition"
+                                  >
+                                    Approve
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleDeclineSwap(req.id)}
+                                    className="rounded-lg border border-slate-300 bg-white px-3 py-1 font-semibold text-slate-700 hover:bg-slate-100 transition"
+                                  >
+                                    Decline
+                                  </button>
+                                </>
+                              ) : (
+                                <span className="rounded-md bg-amber-100 px-2.5 py-1 text-[11px] font-semibold text-amber-800">
+                                  Pending Manager Approval
+                                </span>
+                              )
+                            ) : req.status === "approved" ? (
+                              <span className="rounded-md bg-emerald-100 px-2.5 py-1 text-[11px] font-semibold text-emerald-800">
+                                ✓ Approved
+                              </span>
+                            ) : (
+                              <span className="rounded-md bg-rose-100 px-2.5 py-1 text-[11px] font-semibold text-rose-800">
+                                ✕ Declined
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
                 <div className="mt-8 flex flex-wrap items-center justify-between gap-4">
                   <div>
                     <h2 className="text-lg font-bold">
@@ -658,6 +1121,111 @@ export default function Home() {
                   <p className="mt-5 rounded-xl border border-slate-200 bg-white p-6 text-sm text-slate-500">
                     Loading shifts from database…
                   </p>
+                ) : shiftLoadStatus === "unauthenticated" ? (
+                  <div className="mt-5 rounded-2xl border border-slate-200 bg-white p-8 text-center shadow-sm">
+                    <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-slate-100 text-xl">
+                      🔐
+                    </div>
+                    <h3 className="mt-3 text-base font-bold text-slate-900">
+                      Sign In Required
+                    </h3>
+                    <p className="mx-auto mt-1 max-w-md text-sm text-slate-500">
+                      {statusMessage ||
+                        "Sign in required to view shifts. Please sign in to access your team schedule."}
+                    </p>
+                    <div className="mt-5 flex flex-wrap items-center justify-center gap-3">
+                      <button
+                        type="button"
+                        onClick={() => setShowLoginModal(true)}
+                        className="inline-flex items-center gap-2 rounded-xl bg-slate-900 px-5 py-2.5 text-sm font-semibold text-white shadow transition hover:bg-slate-700"
+                      >
+                        🔐 Sign In
+                      </button>
+                      <Link
+                        href="/sign-up"
+                        className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-5 py-2.5 text-sm font-semibold text-slate-800 shadow-sm transition hover:bg-slate-50"
+                      >
+                        Create Account
+                      </Link>
+                    </div>
+                  </div>
+                ) : shiftLoadStatus === "forbidden" ? (
+                  <div className="mt-5 rounded-3xl border border-amber-200 bg-gradient-to-b from-amber-50/70 to-white p-8 sm:p-10 shadow-sm text-center">
+                    <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-amber-100 text-2xl text-amber-900 shadow-inner">
+                      🏢
+                    </div>
+                    <h3 className="mt-4 text-xl font-bold tracking-tight text-slate-900">
+                      Welcome to Rota{currentUser ? `, ${currentUser.name}` : ""}!
+                    </h3>
+                    <p className="mx-auto mt-2 max-w-md text-sm leading-relaxed text-slate-600">
+                      Your account is ready, but you aren&apos;t part of an active workspace yet. Create your clinic or organization workspace below to start scheduling shifts as the workspace Owner.
+                    </p>
+
+                    {workspaceError && (
+                      <div className="mx-auto mt-4 max-w-md rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 text-left">
+                        {workspaceError}
+                      </div>
+                    )}
+
+                    <form
+                      onSubmit={handleCreateWorkspace}
+                      className="mx-auto mt-6 flex max-w-md flex-col gap-3 sm:flex-row"
+                    >
+                      <input
+                        type="text"
+                        value={newWorkspaceName}
+                        onChange={(e) => {
+                          setNewWorkspaceName(e.target.value);
+                          if (workspaceError) setWorkspaceError("");
+                        }}
+                        placeholder="e.g. City General Clinic, Starlight Medical"
+                        disabled={creatingWorkspace}
+                        maxLength={100}
+                        required
+                        className="flex-1 rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-medium text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 disabled:bg-slate-100"
+                      />
+                      <button
+                        type="submit"
+                        disabled={creatingWorkspace || !newWorkspaceName.trim()}
+                        className="inline-flex items-center justify-center gap-2 rounded-xl bg-indigo-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {creatingWorkspace ? (
+                          <>
+                            <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
+                            Creating...
+                          </>
+                        ) : (
+                          "Create Workspace"
+                        )}
+                      </button>
+                    </form>
+
+                    <p className="mx-auto mt-4 max-w-md text-xs text-slate-500">
+                      Joining an existing team instead? Ask your organization administrator to invite{" "}
+                      <span className="font-semibold text-slate-700">{currentUser?.email || "your email"}</span>.
+                    </p>
+                  </div>
+                ) : shiftLoadStatus === "network_error" ? (
+                  <div className="mt-5 rounded-2xl border border-rose-200 bg-rose-50 p-8 text-center shadow-sm">
+                    <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-rose-100 text-xl text-rose-800">
+                      ⚠
+                    </div>
+                    <h3 className="mt-3 text-base font-bold text-rose-900">
+                      Unable to Load Shifts
+                    </h3>
+                    <p className="mx-auto mt-1 max-w-md text-sm text-rose-700">
+                      {error || "Could not load shifts. Check your connection and try again."}
+                    </p>
+                    <div className="mt-4">
+                      <button
+                        type="button"
+                        onClick={() => void loadShifts()}
+                        className="rounded-xl border border-rose-300 bg-white px-4 py-2 text-xs font-semibold text-rose-800 hover:bg-rose-100 transition"
+                      >
+                        Retry
+                      </button>
+                    </div>
+                  </div>
                 ) : schedule.length === 0 ? (
                   <p className="mt-5 rounded-xl border border-slate-200 bg-white p-6 text-sm text-slate-500">
                     No shifts scheduled yet. Click “+ Add shift” to schedule your first shift.
@@ -667,9 +1235,18 @@ export default function Home() {
                     {visibleSchedule.map((shift) => {
                       const isPermitted =
                         currentUser !== null &&
-                        canManageShiftRecord(
-                          { userId: currentUser.id, role: currentUser.role },
-                          { id: shift.id, user_id: shift.userId, employee_name: shift.name }
+                        canManageTeamShiftRecord(
+                          {
+                            userId: currentUser.id,
+                            role: currentUser.role,
+                            teamId: currentUser.teamId ?? null,
+                          },
+                          {
+                            id: shift.id,
+                            user_id: shift.userId,
+                            employee_name: shift.name,
+                            teamId: shift.teamId ?? null,
+                          }
                         );
 
                       const isLegacy = shift.userId === null || shift.userId === undefined;
@@ -719,6 +1296,14 @@ export default function Home() {
                               {shift.start} – {shift.end}
                             </p>
                             <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => handleStartSwap(shift)}
+                                className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition hover:border-slate-400 hover:bg-slate-50"
+                                aria-label={`Request swap for shift on ${shift.date}`}
+                              >
+                                Swap
+                              </button>
                               <button
                                 type="button"
                                 onClick={() => handleStartEdit(shift)}
@@ -796,18 +1381,37 @@ export default function Home() {
               </div>
 
               <div>
-                <label className="mb-1 block text-xs font-semibold text-slate-700" htmlFor="password">
-                  Password
-                </label>
-                <input
-                  id="password"
-                  type="password"
-                  required
-                  value={loginPassword}
-                  onChange={(e) => setLoginPassword(e.target.value)}
-                  placeholder="••••••••"
-                  className="w-full rounded-xl border border-slate-300 px-3 py-2.5 text-sm outline-none focus:border-lime-500"
-                />
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs font-semibold text-slate-700" htmlFor="password">
+                    Password
+                  </label>
+                  <Link
+                    href="/forgot-password"
+                    onClick={() => setShowLoginModal(false)}
+                    className="text-xs font-medium text-slate-500 hover:text-slate-900 hover:underline"
+                  >
+                    Forgot password?
+                  </Link>
+                </div>
+                <div className="relative">
+                  <input
+                    id="password"
+                    type={showLoginPassword ? "text" : "password"}
+                    required
+                    value={loginPassword}
+                    onChange={(e) => setLoginPassword(e.target.value)}
+                    placeholder="••••••••"
+                    className="w-full rounded-xl border border-slate-300 px-3 py-2.5 pr-10 text-sm outline-none focus:border-slate-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowLoginPassword(!showLoginPassword)}
+                    aria-label={showLoginPassword ? "Hide password" : "Show password"}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 p-1 text-xs font-semibold"
+                  >
+                    {showLoginPassword ? "Hide" : "Show"}
+                  </button>
+                </div>
               </div>
 
               <button
@@ -817,6 +1421,28 @@ export default function Home() {
               >
                 {loggingIn ? "Verifying credentials…" : "Sign In"}
               </button>
+
+              <div className="pt-2 text-center text-xs text-slate-500 space-y-1">
+                <div>
+                  Don&apos;t have an account?{" "}
+                  <Link
+                    href="/sign-up"
+                    onClick={() => setShowLoginModal(false)}
+                    className="font-semibold text-slate-900 hover:underline"
+                  >
+                    Sign up
+                  </Link>
+                </div>
+                <div>
+                  <Link
+                    href="/sign-in"
+                    onClick={() => setShowLoginModal(false)}
+                    className="text-slate-400 hover:text-slate-600 hover:underline"
+                  >
+                    Open dedicated sign-in page →
+                  </Link>
+                </div>
+              </div>
             </form>
           </div>
         </div>
@@ -876,11 +1502,14 @@ export default function Home() {
               onChange={(e) => setRole(e.target.value)}
               className="mb-4 w-full rounded-xl border border-slate-300 bg-white px-3 py-3"
             >
-              <option>Front Desk</option>
-              <option>Operations</option>
-              <option>Customer Support</option>
-              <option>Supervisor</option>
-              <option>Frontend Developer</option>
+              {APP_ROLES.map((appRole) => (
+                <option key={appRole} value={appRole}>
+                  {appRole}
+                </option>
+              ))}
+              {!(APP_ROLES as readonly string[]).includes(role) && role && (
+                <option value={role}>{role}</option>
+              )}
             </select>
 
             <label className="mb-2 block text-sm font-medium" htmlFor="day">
@@ -960,6 +1589,191 @@ export default function Home() {
                 {deleting ? "Deleting…" : "Confirm delete"}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Shift Swap Request Modal */}
+      {swappingShift && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4">
+          <div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl">
+            <div className="mb-4 flex items-center justify-between">
+              <div>
+                <h2 className="text-xl font-bold text-slate-900">Request Shift Swap</h2>
+                <p className="text-xs text-slate-500">
+                  Transfer or exchange coverage with a team member
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSwappingShift(null)}
+                className="rounded-lg p-2 text-slate-400 hover:bg-slate-100"
+                aria-label="Close"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="rounded-xl border border-slate-100 bg-slate-50 p-3.5 mb-4 text-xs space-y-1">
+              <p>
+                <span className="text-slate-500">Current Shift:</span>{" "}
+                <strong>{swappingShift.name}</strong> ({swappingShift.role})
+              </p>
+              <p>
+                <span className="text-slate-500">Date:</span>{" "}
+                <strong>{swappingShift.day}, {swappingShift.date}</strong>
+              </p>
+              <p>
+                <span className="text-slate-500">Hours:</span>{" "}
+                <strong>{swappingShift.start} – {swappingShift.end}</strong>
+              </p>
+            </div>
+
+            <form onSubmit={handleConfirmSwap} className="space-y-4">
+              <div>
+                <label
+                  htmlFor="swap-target"
+                  className="block text-xs font-semibold uppercase tracking-wider text-slate-600 mb-1"
+                >
+                  Swap With Team Member
+                </label>
+                <select
+                  id="swap-target"
+                  required
+                  value={swapTarget}
+                  onChange={(e) => setSwapTarget(e.target.value)}
+                  className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm"
+                >
+                  {team
+                    .filter((m) => m.name !== swappingShift.name)
+                    .map((m) => (
+                      <option key={m.name} value={m.name}>
+                        {m.name} ({m.role})
+                      </option>
+                    ))}
+                </select>
+              </div>
+
+              <div>
+                <label
+                  htmlFor="swap-reason"
+                  className="block text-xs font-semibold uppercase tracking-wider text-slate-600 mb-1"
+                >
+                  Reason / Notes (Optional)
+                </label>
+                <input
+                  id="swap-reason"
+                  type="text"
+                  value={swapReason}
+                  onChange={(e) => setSwapReason(e.target.value)}
+                  placeholder="e.g. Coverage requested, schedule conflict"
+                  className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm"
+                />
+              </div>
+
+              <div className="flex gap-3 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setSwappingShift(null)}
+                  className="w-1/3 rounded-xl border border-slate-300 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-100 transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={submittingSwap}
+                  className="w-2/3 rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white shadow hover:bg-slate-800 disabled:opacity-60 transition"
+                >
+                  {submittingSwap
+                    ? "Submitting…"
+                    : isManager
+                    ? "Approve & Execute Swap"
+                    : "Submit Swap Request"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Invite Team Member Modal */}
+      {showInviteModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4">
+          <div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl">
+            <div className="mb-4 flex items-center justify-between">
+              <div>
+                <h2 className="text-xl font-bold text-slate-900">Invite Team Member</h2>
+                <p className="text-xs text-slate-500">
+                  Add an employee to the workspace roster
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowInviteModal(false)}
+                className="rounded-lg p-2 text-slate-400 hover:bg-slate-100"
+                aria-label="Close"
+              >
+                ✕
+              </button>
+            </div>
+
+            <form onSubmit={handleInviteMember} className="space-y-4">
+              <div>
+                <label
+                  htmlFor="invite-name"
+                  className="block text-xs font-semibold uppercase tracking-wider text-slate-600 mb-1"
+                >
+                  Employee Name
+                </label>
+                <input
+                  id="invite-name"
+                  type="text"
+                  required
+                  autoFocus
+                  value={inviteName}
+                  onChange={(e) => setInviteName(e.target.value)}
+                  placeholder="e.g. Emeka Okafor"
+                  className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm"
+                />
+              </div>
+
+              <div>
+                <label
+                  htmlFor="invite-role"
+                  className="block text-xs font-semibold uppercase tracking-wider text-slate-600 mb-1"
+                >
+                  Position / Role
+                </label>
+                <select
+                  id="invite-role"
+                  value={inviteRole}
+                  onChange={(e) => setInviteRole(e.target.value)}
+                  className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm"
+                >
+                  <option value="Front Desk">Front Desk</option>
+                  <option value="Customer Support">Customer Support</option>
+                  <option value="Operations">Operations</option>
+                  <option value="Supervisor">Supervisor</option>
+                </select>
+              </div>
+
+              <div className="flex gap-3 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowInviteModal(false)}
+                  className="w-1/3 rounded-xl border border-slate-300 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-100 transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={inviting}
+                  className="w-2/3 rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white shadow hover:bg-slate-800 disabled:opacity-60 transition"
+                >
+                  {inviting ? "Adding…" : "Send Invite"}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}
