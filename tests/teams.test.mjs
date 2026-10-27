@@ -1,7 +1,7 @@
 import test, { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { handleCreateTeam, generateBaseSlug } from "../app/api/teams/route.ts";
+import { handleCreateTeam, generateBaseSlug } from "../lib/teams.ts";
 import { verifySessionToken } from "../lib/auth.ts";
 import { canManageTeamShiftRecord } from "../lib/permissions.ts";
 
