@@ -5,10 +5,13 @@ import Link from "next/link";
 import { canManageTeamShiftRecord, isManagerRole, APP_ROLES } from "@/lib/permissions";
 import {
   resolveShiftFetchResponse,
+  resolveShiftRecoveryResponse,
   mapApiShift,
   type ApiShift,
   type ScheduleShift,
+  type ShiftRecoveryOutcome,
 } from "@/lib/shifts-client";
+import type { RecoverableShift } from "@/lib/shift-recovery";
 
 type AuthUser = {
   id: number;
@@ -16,6 +19,14 @@ type AuthUser = {
   name: string;
   role: string;
   teamId?: number | null;
+};
+
+type UserWorkspace = {
+  id: number;
+  name: string;
+  slug?: string;
+  role: string;
+  is_default?: boolean;
 };
 
 type ShiftSwapRequest = {
@@ -92,6 +103,24 @@ export default function Home() {
   const [newWorkspaceName, setNewWorkspaceName] = useState("");
   const [creatingWorkspace, setCreatingWorkspace] = useState(false);
   const [workspaceError, setWorkspaceError] = useState("");
+
+  // Legacy Shift Recovery states
+  const [recoverableShifts, setRecoverableShifts] = useState<RecoverableShift[]>([]);
+  const [checkingRecovery, setCheckingRecovery] = useState(false);
+  const [showRecoveryModal, setShowRecoveryModal] = useState(false);
+  const [recoveryWorkspaces, setRecoveryWorkspaces] = useState<UserWorkspace[]>([]);
+  const [selectedTargetTeamId, setSelectedTargetTeamId] = useState<number | "">("");
+  const [recoveryConfirmed, setRecoveryConfirmed] = useState(false);
+  const [recovering, setRecovering] = useState(false);
+  const [recoveryError, setRecoveryError] = useState("");
+  const [recoverySuccess, setRecoverySuccess] = useState("");
+
+  // Workspace Subscription & Billing states
+  const [subscriptionPlan, setSubscriptionPlan] = useState<string>("free");
+  const [subscriptionSeats, setSubscriptionSeats] = useState<number>(5);
+  const [showBillingModal, setShowBillingModal] = useState<boolean>(false);
+  const [upgradingPlan, setUpgradingPlan] = useState<boolean>(false);
+  const [billingError, setBillingError] = useState<string>("");
 
   // Schedule & team
   const [schedule, setSchedule] = useState<ScheduleShift[]>([]);
@@ -171,14 +200,142 @@ export default function Home() {
     }
   }, []);
 
-  // Load shifts only after the authentication state is known
+  // Check legacy shifts available for recovery
+  const checkRecoverableShifts = useCallback(
+    async (user?: AuthUser | null) => {
+      const targetUser = user !== undefined ? user : currentUser;
+      if (!targetUser) {
+        setRecoverableShifts([]);
+        return;
+      }
+
+      setCheckingRecovery(true);
+      try {
+        const res = await fetch("/api/shifts/recover");
+        if (res.status === 401) {
+          setRecoverableShifts([]);
+          return;
+        }
+        if (res.ok) {
+          const data = await res.json();
+          setRecoverableShifts(Array.isArray(data.shifts) ? data.shifts : []);
+        } else {
+          setRecoverableShifts([]);
+        }
+      } catch {
+        setRecoverableShifts([]);
+      } finally {
+        setCheckingRecovery(false);
+      }
+    },
+    [currentUser]
+  );
+
+  const loadBillingStatus = useCallback(async (user?: AuthUser | null) => {
+    const targetUser = user !== undefined ? user : currentUser;
+    if (!targetUser?.teamId) {
+      setSubscriptionPlan("free");
+      setSubscriptionSeats(5);
+      return;
+    }
+
+    try {
+      const res = await fetch("/api/billing");
+      if (res.ok) {
+        const data = await res.json();
+        if (data.subscription?.planId) {
+          setSubscriptionPlan(data.subscription.planId);
+          setSubscriptionSeats(data.subscription.seats || 5);
+        }
+      }
+    } catch {
+      // Graceful fallback to default free tier
+    }
+  }, [currentUser]);
+
+  const handleUpgradePlan = async (targetPlan: string) => {
+    setUpgradingPlan(true);
+    setBillingError("");
+
+    try {
+      const res = await fetch("/api/billing/checkout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          workspaceId: currentUser?.teamId,
+          targetPlan,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        setBillingError(data.message || "Failed to initialize checkout.");
+        return;
+      }
+
+      if (data.sessionId) {
+        // In test mode / mock mode, immediately verify and confirm payment server-side
+        const confirmRes = await fetch("/api/billing/confirm", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId: data.sessionId }),
+        });
+
+        const confirmData = await confirmRes.json();
+        if (confirmRes.ok && confirmData.success) {
+          setSubscriptionPlan(confirmData.subscription?.planId || targetPlan);
+          setSubscriptionSeats(confirmData.subscription?.seats || data.seats || 15);
+          setShowBillingModal(false);
+          setNotice(
+            `Workspace subscription successfully upgraded to ${targetPlan.toUpperCase()} tier (${
+              confirmData.subscription?.seats || data.seats
+            } seats).`
+          );
+        } else {
+          setBillingError(confirmData.message || "Payment confirmation failed.");
+        }
+      }
+    } catch (err: any) {
+      setBillingError(err?.message || "Failed to connect to billing service.");
+    } finally {
+      setUpgradingPlan(false);
+    }
+  };
+
+  // Load shifts and verify authentication on load
   useEffect(() => {
     let active = true;
 
     async function initialize() {
-      await checkSession();
+      const user = await checkSession();
       if (active) {
         await loadShifts();
+        if (user) {
+          await checkRecoverableShifts(user);
+          await loadBillingStatus(user);
+
+          // Check if returning from checkout with session_id parameter
+          if (typeof window !== "undefined") {
+            const params = new URLSearchParams(window.location.search);
+            const sessionId = params.get("session_id");
+            if (sessionId) {
+              try {
+                const confirmRes = await fetch("/api/billing/confirm", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ sessionId }),
+                });
+                const confirmData = await confirmRes.json();
+                if (confirmRes.ok && confirmData.success) {
+                  setNotice("Payment verified! Your workspace subscription has been updated.");
+                  await loadBillingStatus(user);
+                }
+              } catch {
+                // Ignore transient query param error
+              }
+            }
+          }
+        }
       }
     }
 
@@ -187,7 +344,7 @@ export default function Home() {
     return () => {
       active = false;
     };
-  }, [checkSession, loadShifts]);
+  }, [checkSession, loadShifts, checkRecoverableShifts, loadBillingStatus]);
 
   async function handleLogin(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -215,6 +372,8 @@ export default function Home() {
       setLoginPassword("");
       setNotice(`Signed in securely as ${data.name} (${data.role}).`);
       await loadShifts();
+      await checkRecoverableShifts(data);
+      await loadBillingStatus(data);
     } catch (err) {
       setLoginError(err instanceof Error ? err.message : "Unable to sign in.");
     } finally {
@@ -256,6 +415,10 @@ export default function Home() {
         setCurrentUser(user);
       }
       await loadShifts();
+      if (user) {
+        await checkRecoverableShifts(user);
+        await loadBillingStatus(user);
+      }
     } catch (err: unknown) {
       setWorkspaceError(
         err instanceof Error ? err.message : "An unexpected error occurred while creating your workspace."
@@ -269,10 +432,142 @@ export default function Home() {
     try {
       await fetch("/api/auth/logout", { method: "POST" });
       setCurrentUser(null);
+      setRecoverableShifts([]);
+      setSubscriptionPlan("free");
+      setSubscriptionSeats(5);
       setNotice("You have signed out successfully.");
       await loadShifts();
     } catch {
       setError("Failed to sign out cleanly.");
+    }
+  }
+
+  async function handleOpenRecoveryModal() {
+    if (!currentUser) {
+      setShowLoginModal(true);
+      setNotice("Please sign in to recover legacy shifts.");
+      return;
+    }
+
+    setRecoveryError("");
+    setRecoverySuccess("");
+    setRecoveryConfirmed(false);
+    setShowRecoveryModal(true);
+
+    try {
+      const res = await fetch("/api/teams");
+      if (res.status === 401) {
+        setShowRecoveryModal(false);
+        setCurrentUser(null);
+        setShowLoginModal(true);
+        setNotice("Your session expired. Please sign in again.");
+        return;
+      }
+      if (res.ok) {
+        const data = await res.json();
+        const teamsList: UserWorkspace[] = Array.isArray(data.teams) ? data.teams : [];
+        setRecoveryWorkspaces(teamsList);
+        if (currentUser.teamId && teamsList.some((t) => t.id === currentUser.teamId)) {
+          setSelectedTargetTeamId(currentUser.teamId);
+        } else if (teamsList.length === 1) {
+          setSelectedTargetTeamId(teamsList[0].id);
+        } else {
+          setSelectedTargetTeamId("");
+        }
+      } else if (currentUser.teamId) {
+        setRecoveryWorkspaces([
+          { id: currentUser.teamId, name: `Workspace #${currentUser.teamId}`, role: currentUser.role },
+        ]);
+        setSelectedTargetTeamId(currentUser.teamId);
+      }
+    } catch {
+      if (currentUser?.teamId) {
+        setRecoveryWorkspaces([
+          { id: currentUser.teamId, name: `Workspace #${currentUser.teamId}`, role: currentUser.role },
+        ]);
+        setSelectedTargetTeamId(currentUser.teamId);
+      }
+    }
+  }
+
+  async function handleSubmitRecovery(e: React.FormEvent) {
+    e.preventDefault();
+    if (recovering) return;
+
+    if (!selectedTargetTeamId || typeof selectedTargetTeamId !== "number") {
+      setRecoveryError("Please select a workspace you are authorized to access.");
+      return;
+    }
+
+    if (!recoveryConfirmed) {
+      setRecoveryError("Please check the confirmation box before submitting recovery.");
+      return;
+    }
+
+    setRecovering(true);
+    setRecoveryError("");
+    setRecoverySuccess("");
+
+    try {
+      const res = await fetch("/api/shifts/recover", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          targetTeamId: selectedTargetTeamId,
+        }),
+      });
+
+      let body: unknown = null;
+      try {
+        body = await res.json();
+      } catch {
+        // Non-JSON response
+      }
+
+      const outcome = resolveShiftRecoveryResponse(res.status, body);
+
+      if (outcome.status === "unauthenticated") {
+        setShowRecoveryModal(false);
+        setCurrentUser(null);
+        setShowLoginModal(true);
+        setNotice("Your session expired. Please sign in again to recover shifts.");
+        return;
+      }
+
+      if (outcome.status === "forbidden") {
+        setRecoveryError(outcome.message);
+        return;
+      }
+
+      if (outcome.status === "conflict" || outcome.status === "error") {
+        setRecoveryError(outcome.message);
+        return;
+      }
+
+      const count = outcome.recoveredCount > 0 ? outcome.recoveredCount : recoverableShifts.length;
+      const targetName =
+        recoveryWorkspaces.find((w) => w.id === selectedTargetTeamId)?.name ||
+        `Workspace #${selectedTargetTeamId}`;
+
+      setRecoverySuccess(
+        count > 0
+          ? `Successfully recovered ${count} legacy shift${count === 1 ? "" : "s"} into ${targetName}!`
+          : "All legacy shifts have already been recovered."
+      );
+      setNotice(`Successfully recovered ${count} legacy shift(s) into ${targetName}.`);
+
+      // Refresh shifts and update recovery state
+      await loadShifts();
+      await checkRecoverableShifts();
+
+      setTimeout(() => {
+        setShowRecoveryModal(false);
+        setRecoverySuccess("");
+      }, 1200);
+    } catch {
+      setRecoveryError("A network error occurred while recovering shifts. Please try again.");
+    } finally {
+      setRecovering(false);
     }
   }
 
@@ -793,6 +1088,39 @@ export default function Home() {
               </div>
             )}
 
+            {/* Legacy Shift Recovery Banner */}
+            {currentUser && recoverableShifts.length > 0 && (
+              <div className="mb-6 rounded-2xl border border-indigo-200 bg-gradient-to-r from-indigo-50/90 via-sky-50/70 to-indigo-50/90 p-5 shadow-xs">
+                <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                  <div className="flex items-start gap-3.5">
+                    <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-indigo-600 text-lg text-white shadow-xs">
+                      📦
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <h3 className="text-sm font-bold text-indigo-950">
+                          Legacy Shifts Pending Recovery
+                        </h3>
+                        <span className="rounded-full bg-indigo-100 px-2.5 py-0.5 text-xs font-bold text-indigo-800">
+                          {recoverableShifts.length} {recoverableShifts.length === 1 ? "shift" : "shifts"}
+                        </span>
+                      </div>
+                      <p className="mt-1 text-xs text-indigo-900/80 leading-relaxed max-w-2xl">
+                        You have {recoverableShifts.length} historical shift{recoverableShifts.length === 1 ? "" : "s"} linked to your account from before team isolation was established. Recover them to bring them into your active team schedule.
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleOpenRecoveryModal}
+                    className="shrink-0 rounded-xl bg-indigo-600 px-4 py-2.5 text-xs font-bold text-white shadow-xs transition hover:bg-indigo-500"
+                  >
+                    Recover Shifts →
+                  </button>
+                </div>
+              </div>
+            )}
+
             {/* Overview Stats */}
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
               <div className="rounded-2xl border border-slate-200 bg-white p-5">
@@ -993,6 +1321,86 @@ export default function Home() {
                             <span className="text-slate-400">Manage colleague shifts (Manager role required)</span>
                           </>
                         )}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="mt-6 border-t border-slate-100 pt-6">
+                    <div className="flex flex-wrap items-center justify-between gap-4 mb-3">
+                      <div>
+                        <h3 className="text-sm font-bold text-slate-900">
+                          Workspace Subscription &amp; Billing
+                        </h3>
+                        <p className="text-xs text-slate-500 mt-0.5">
+                          Manage workspace seat capacity and billing tiers powered by Stripe test-mode integration.
+                        </p>
+                      </div>
+                      {currentUser && isManager && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setBillingError("");
+                            setShowBillingModal(true);
+                          }}
+                          className="rounded-xl bg-slate-900 px-3.5 py-2 text-xs font-semibold text-white hover:bg-slate-800 transition shadow-xs"
+                        >
+                          Change Plan
+                        </button>
+                      )}
+                    </div>
+                    <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 text-xs text-slate-600">
+                      <div className="flex items-center justify-between">
+                        <span>Current Tier:</span>
+                        <span className="font-bold uppercase tracking-wider text-slate-900 bg-white border border-slate-200 px-2.5 py-0.5 rounded-md">
+                          {subscriptionPlan} Plan
+                        </span>
+                      </div>
+                      <div className="mt-2.5 flex items-center justify-between">
+                        <span>Seat Capacity:</span>
+                        <span className="font-semibold text-slate-800">
+                          {team.length} / {subscriptionSeats} seats allocated
+                        </span>
+                      </div>
+                      <div className="mt-2.5 text-[11px] text-slate-500 border-t border-slate-200 pt-2 flex items-center justify-between">
+                        <span>Server-Side Payment Verification:</span>
+                        <span className="text-emerald-700 font-medium">Authoritative · Verified via Stripe</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="mt-6 border-t border-slate-100 pt-6">
+                    <div className="flex flex-wrap items-center justify-between gap-4 mb-3">
+                      <div>
+                        <h3 className="text-sm font-bold text-slate-900">
+                          Legacy Shift Recovery & Data Integrity
+                        </h3>
+                        <p className="text-xs text-slate-500 mt-0.5">
+                          Pre-migration shifts without team assignment are securely quarantined until recovered into an authorized workspace.
+                        </p>
+                      </div>
+                      {currentUser && recoverableShifts.length > 0 ? (
+                        <button
+                          type="button"
+                          onClick={handleOpenRecoveryModal}
+                          className="rounded-xl bg-indigo-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-indigo-500 transition shadow-xs"
+                        >
+                          Recover {recoverableShifts.length} Shift{recoverableShifts.length === 1 ? "" : "s"}
+                        </button>
+                      ) : (
+                        <span className="rounded-md bg-emerald-100 px-2.5 py-1 text-xs font-semibold text-emerald-800">
+                          ✓ Fully Recovered
+                        </span>
+                      )}
+                    </div>
+                    <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 text-xs text-slate-600">
+                      <div className="flex items-center justify-between">
+                        <span>Your unassigned legacy shifts:</span>
+                        <span className="font-bold font-mono text-slate-900">
+                          {currentUser ? `${recoverableShifts.length} pending` : "Sign in to check"}
+                        </span>
+                      </div>
+                      <div className="mt-2 text-[11px] text-slate-500 border-t border-slate-200 pt-2">
+                        Note: Unowned orphan shifts (where no user account was linked) remain archived in the database and require verified administrator review.
                       </div>
                     </div>
                   </div>
@@ -1774,6 +2182,363 @@ export default function Home() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Legacy Shift Recovery Modal */}
+      {showRecoveryModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-lg rounded-3xl bg-white p-6 shadow-2xl sm:p-8 max-h-[90vh] overflow-y-auto">
+            <div className="mb-5 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-100 text-indigo-700 text-lg shadow-xs">
+                  📦
+                </div>
+                <div>
+                  <h2 className="text-xl font-bold text-slate-900">Recover Legacy Shifts</h2>
+                  <p className="text-xs text-slate-500">
+                    Assign your historical shifts into an authorized workspace
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  if (!recovering) {
+                    setShowRecoveryModal(false);
+                    setRecoveryError("");
+                    setRecoverySuccess("");
+                  }
+                }}
+                className="rounded-lg p-2 text-slate-400 hover:bg-slate-100 disabled:opacity-50"
+                disabled={recovering}
+                aria-label="Close"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Loading state */}
+            {checkingRecovery ? (
+              <div className="p-8 text-center text-sm text-slate-500">
+                <span className="inline-block h-5 w-5 animate-spin rounded-full border-2 border-indigo-600 border-t-transparent mr-2 align-middle" />
+                Checking for recoverable shifts…
+              </div>
+            ) : recoverableShifts.length === 0 ? (
+              /* Empty state */
+              <div className="rounded-2xl border border-slate-200 bg-slate-50 p-6 text-center">
+                <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-full bg-emerald-100 text-emerald-800 text-base mb-2">
+                  ✓
+                </div>
+                <h3 className="text-sm font-bold text-slate-900">No Legacy Shifts Pending</h3>
+                <p className="mt-1 text-xs text-slate-500">
+                  All historical shifts linked to your account are assigned to active workspaces.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => setShowRecoveryModal(false)}
+                  className="mt-4 rounded-xl bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800 transition"
+                >
+                  Close
+                </button>
+              </div>
+            ) : (
+              <form onSubmit={handleSubmitRecovery} className="space-y-5">
+                {recoveryError && (
+                  <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs text-rose-800 flex items-start gap-2">
+                    <span className="font-bold text-rose-600">⚠</span>
+                    <span>{recoveryError}</span>
+                  </div>
+                )}
+
+                {recoverySuccess && (
+                  <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-xs text-emerald-800 flex items-start gap-2">
+                    <span className="font-bold text-emerald-600">✓</span>
+                    <span>{recoverySuccess}</span>
+                  </div>
+                )}
+
+                {/* Shifts Preview */}
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <label className="text-xs font-bold uppercase tracking-wider text-slate-700">
+                      Shifts to Recover ({recoverableShifts.length})
+                    </label>
+                    <span className="text-[11px] text-slate-500">
+                      Verified owner: {currentUser?.name}
+                    </span>
+                  </div>
+                  <div className="max-h-44 overflow-y-auto rounded-xl border border-slate-200 bg-slate-50/50 p-2 divide-y divide-slate-100">
+                    {recoverableShifts.map((shift) => (
+                      <div
+                        key={shift.id}
+                        className="py-1.5 first:pt-0 flex items-center justify-between text-xs text-slate-700 px-2"
+                      >
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono font-bold text-slate-900">
+                            {shift.shift_day}
+                          </span>
+                          <span className="rounded-md bg-slate-200/80 px-2 py-0.5 text-[10px] font-semibold text-slate-700">
+                            {shift.role}
+                          </span>
+                        </div>
+                        <span className="text-[11px] text-slate-400 font-mono">
+                          Shift #{shift.id}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                  <p className="mt-1 text-[11px] text-slate-400">
+                    Shift IDs, dates, roles, and employee names are completely preserved.
+                  </p>
+                </div>
+
+                {/* Destination Workspace Selection */}
+                <div>
+                  <label
+                    htmlFor="target-workspace-select"
+                    className="block text-xs font-bold uppercase tracking-wider text-slate-700 mb-1"
+                  >
+                    Select Destination Workspace *
+                  </label>
+                  {recoveryWorkspaces.length === 0 ? (
+                    <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-xs text-amber-900">
+                      <p className="font-bold mb-1">No Authorized Workspaces Found</p>
+                      <p className="mb-3">
+                        You must be a member of at least one workspace to recover legacy shifts.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowRecoveryModal(false);
+                          setActiveTab("Overview");
+                        }}
+                        className="rounded-lg bg-amber-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-amber-800 transition"
+                      >
+                        Create Workspace First
+                      </button>
+                    </div>
+                  ) : (
+                    <select
+                      id="target-workspace-select"
+                      value={selectedTargetTeamId}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setSelectedTargetTeamId(val ? Number(val) : "");
+                        if (recoveryError) setRecoveryError("");
+                      }}
+                      disabled={recovering}
+                      required
+                      className="w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-sm font-medium text-slate-900 shadow-2xs focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 disabled:bg-slate-100"
+                    >
+                      <option value="">-- Choose an authorized workspace --</option>
+                      {recoveryWorkspaces.map((ws) => (
+                        <option key={ws.id} value={ws.id}>
+                          {ws.name} ({ws.role}) · Workspace #{ws.id}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                  <p className="mt-1 text-[11px] text-slate-500">
+                    Only workspaces where you have verified membership can be selected.
+                  </p>
+                </div>
+
+                {/* Confirmation Checkbox */}
+                {recoveryWorkspaces.length > 0 && (
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 p-3.5">
+                    <label className="flex items-start gap-2.5 cursor-pointer text-xs text-slate-700 select-none">
+                      <input
+                        id="recovery-confirm-check"
+                        type="checkbox"
+                        checked={recoveryConfirmed}
+                        onChange={(e) => {
+                          setRecoveryConfirmed(e.target.checked);
+                          if (recoveryError) setRecoveryError("");
+                        }}
+                        disabled={recovering}
+                        className="mt-0.5 h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                      />
+                      <span>
+                        I confirm that I want to assign these <strong>{recoverableShifts.length}</strong> legacy shift(s) to{" "}
+                        <strong>
+                          {recoveryWorkspaces.find((w) => w.id === selectedTargetTeamId)?.name || "the selected workspace"}
+                        </strong>.
+                      </span>
+                    </label>
+                  </div>
+                )}
+
+                {/* Action Buttons */}
+                <div className="flex gap-3 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowRecoveryModal(false);
+                      setRecoveryError("");
+                      setRecoverySuccess("");
+                    }}
+                    disabled={recovering}
+                    className="w-1/3 rounded-xl border border-slate-300 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-100 disabled:opacity-50 transition"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={recovering || !selectedTargetTeamId || !recoveryConfirmed || recoveryWorkspaces.length === 0}
+                    className="w-2/3 inline-flex items-center justify-center gap-2 rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed transition"
+                  >
+                    {recovering ? (
+                      <>
+                        <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
+                        Recovering shifts…
+                      </>
+                    ) : (
+                      `Confirm & Recover (${recoverableShifts.length})`
+                    )}
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
+        </div>
+      )}
+      {/* Workspace Plan Upgrade Modal */}
+      {showBillingModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4">
+          <div className="w-full max-w-lg rounded-2xl bg-white p-6 shadow-xl max-h-[90vh] overflow-y-auto">
+            <div className="mb-4 flex items-center justify-between">
+              <div>
+                <h2 className="text-xl font-bold text-slate-900">Workspace Subscription Plans</h2>
+                <p className="text-xs text-slate-500">
+                  Select a subscription tier to expand your workspace capacity.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowBillingModal(false);
+                  setBillingError("");
+                }}
+                className="rounded-lg p-2 text-slate-400 hover:bg-slate-100"
+                aria-label="Close"
+              >
+                ✕
+              </button>
+            </div>
+
+            {billingError && (
+              <div className="mb-4 rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-800">
+                {billingError}
+              </div>
+            )}
+
+            <div className="space-y-3 mb-6">
+              {/* Starter Plan Card */}
+              <div
+                className={`rounded-xl border p-4 transition ${
+                  subscriptionPlan === "starter"
+                    ? "border-lime-500 bg-lime-50/40"
+                    : "border-slate-200 bg-white hover:border-slate-300"
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h3 className="font-bold text-slate-900">Starter Tier</h3>
+                    <p className="text-xs text-slate-500">For small clinics and growing teams</p>
+                  </div>
+                  <div className="text-right">
+                    <p className="text-lg font-bold text-slate-900">$29<span className="text-xs text-slate-500 font-normal">/mo</span></p>
+                    <span className="inline-block text-[11px] font-semibold text-lime-800 bg-lime-100 px-2 py-0.5 rounded">
+                      Up to 15 seats
+                    </span>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  disabled={upgradingPlan || subscriptionPlan === "starter"}
+                  onClick={() => handleUpgradePlan("starter")}
+                  className="mt-3 w-full rounded-xl bg-slate-900 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50 transition"
+                >
+                  {subscriptionPlan === "starter" ? "Current Plan" : "Select Starter Plan"}
+                </button>
+              </div>
+
+              {/* Pro Plan Card */}
+              <div
+                className={`rounded-xl border p-4 transition ${
+                  subscriptionPlan === "pro"
+                    ? "border-lime-500 bg-lime-50/40"
+                    : "border-slate-200 bg-white hover:border-slate-300"
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h3 className="font-bold text-slate-900">Professional Tier</h3>
+                    <p className="text-xs text-slate-500">For multi-department medical centers</p>
+                  </div>
+                  <div className="text-right">
+                    <p className="text-lg font-bold text-slate-900">$79<span className="text-xs text-slate-500 font-normal">/mo</span></p>
+                    <span className="inline-block text-[11px] font-semibold text-lime-800 bg-lime-100 px-2 py-0.5 rounded">
+                      Up to 50 seats
+                    </span>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  disabled={upgradingPlan || subscriptionPlan === "pro"}
+                  onClick={() => handleUpgradePlan("pro")}
+                  className="mt-3 w-full rounded-xl bg-slate-900 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50 transition"
+                >
+                  {subscriptionPlan === "pro" ? "Current Plan" : "Select Professional Plan"}
+                </button>
+              </div>
+
+              {/* Enterprise Plan Card */}
+              <div
+                className={`rounded-xl border p-4 transition ${
+                  subscriptionPlan === "enterprise"
+                    ? "border-lime-500 bg-lime-50/40"
+                    : "border-slate-200 bg-white hover:border-slate-300"
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h3 className="font-bold text-slate-900">Enterprise Tier</h3>
+                    <p className="text-xs text-slate-500">For regional hospital networks</p>
+                  </div>
+                  <div className="text-right">
+                    <p className="text-lg font-bold text-slate-900">$299<span className="text-xs text-slate-500 font-normal">/mo</span></p>
+                    <span className="inline-block text-[11px] font-semibold text-lime-800 bg-lime-100 px-2 py-0.5 rounded">
+                      Up to 500 seats
+                    </span>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  disabled={upgradingPlan || subscriptionPlan === "enterprise"}
+                  onClick={() => handleUpgradePlan("enterprise")}
+                  className="mt-3 w-full rounded-xl bg-slate-900 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50 transition"
+                >
+                  {subscriptionPlan === "enterprise" ? "Current Plan" : "Select Enterprise Plan"}
+                </button>
+              </div>
+            </div>
+
+            <div className="border-t border-slate-100 pt-3 flex justify-between items-center text-xs text-slate-400">
+              <span>Test Mode · Server-Side Payment Verification</span>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowBillingModal(false);
+                  setBillingError("");
+                }}
+                className="font-medium text-slate-600 hover:text-slate-900"
+              >
+                Close
+              </button>
+            </div>
           </div>
         </div>
       )}

@@ -271,6 +271,55 @@ export async function handleCreateTeam(
   }
 }
 
+export async function handleGetTeams(
+  deps: CreateTeamDependencies = {}
+): Promise<Response> {
+  try {
+    const { getSessionUser: prodGetSessionUser, sql: prodSql } =
+      !deps.getSessionUser || !deps.sql
+        ? await loadProductionDependencies()
+        : { getSessionUser: deps.getSessionUser, sql: deps.sql };
+
+    const resolveSessionUser = deps.getSessionUser ?? prodGetSessionUser;
+    const executeSql = deps.sql ?? prodSql;
+
+    const sessionUser = await resolveSessionUser({ revalidateWithDb: true });
+    if (!sessionUser || !sessionUser.userId) {
+      return Response.json(
+        { error: "Authentication required to view workspaces." },
+        { status: 401 }
+      );
+    }
+
+    const memberships = await executeSql`
+      SELECT
+        t.id,
+        t.name,
+        t.slug,
+        tm.role,
+        tm.is_default
+      FROM teams t
+      JOIN team_memberships tm ON tm.team_id = t.id
+      WHERE tm.user_id = ${sessionUser.userId}
+      ORDER BY tm.is_default DESC, t.name ASC;
+    `;
+
+    return Response.json({
+      teams: memberships || [],
+    });
+  } catch (error) {
+    console.error("Failed to list workspaces:", error);
+    return Response.json(
+      { error: "Failed to list workspaces." },
+      { status: 500 }
+    );
+  }
+}
+
+export async function GET(request: Request) {
+  return handleGetTeams();
+}
+
 export async function POST(request: Request) {
   return handleCreateTeam(request);
 }

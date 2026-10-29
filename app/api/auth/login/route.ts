@@ -1,22 +1,37 @@
-import { NextResponse } from "next/server";
-import { sql } from "@/lib/db";
-import { createSessionToken, verifyPassword } from "@/lib/auth";
-import { getAuthSecret, getSessionCookieOptions } from "@/lib/session";
+import { createSessionToken, verifyPassword } from "../../../../lib/auth.ts";
+import { getAuthSecret, serializeSessionCookie } from "../../../../lib/session.ts";
 
-export async function POST(request: Request) {
+export type LoginRouteDependencies = {
+  sql?: (strings: TemplateStringsArray, ...values: any[]) => Promise<any>;
+  getSecret?: () => string;
+};
+
+let prodSqlPromise: Promise<any> | null = null;
+
+async function loadProductionSql(): Promise<any> {
+  if (!prodSqlPromise) {
+    prodSqlPromise = import("../../../../lib/db.ts").then((m) => m.sql);
+  }
+  return prodSqlPromise;
+}
+
+export async function handleLogin(
+  request: Request,
+  deps: LoginRouteDependencies = {}
+): Promise<Response> {
   try {
     let body: unknown;
     try {
       body = await request.json();
     } catch {
-      return NextResponse.json(
+      return Response.json(
         { error: "Invalid JSON request body." },
         { status: 400 }
       );
     }
 
     if (!body || typeof body !== "object") {
-      return NextResponse.json(
+      return Response.json(
         { error: "Email and password are required." },
         { status: 400 }
       );
@@ -29,7 +44,7 @@ export async function POST(request: Request) {
       typeof typedBody.password === "string" ? typedBody.password : "";
 
     if (!email || !password) {
-      return NextResponse.json(
+      return Response.json(
         { error: "Email and password are required." },
         { status: 400 }
       );
@@ -37,13 +52,15 @@ export async function POST(request: Request) {
 
     let secret: string;
     try {
-      secret = getAuthSecret();
+      secret = deps.getSecret ? deps.getSecret() : getAuthSecret();
     } catch {
-      return NextResponse.json(
+      return Response.json(
         { error: "Server authentication configuration error." },
         { status: 500 }
       );
     }
+
+    const sql = deps.sql ?? (await loadProductionSql());
 
     // Look up user by normalized email in the database
     const rows = await sql`
@@ -55,7 +72,7 @@ export async function POST(request: Request) {
 
     // Generic response for both user not found and password mismatch
     if (!rows || rows.length === 0) {
-      return NextResponse.json(
+      return Response.json(
         { error: "Invalid email or password." },
         { status: 401 }
       );
@@ -71,7 +88,7 @@ export async function POST(request: Request) {
     );
 
     if (!isPasswordValid) {
-      return NextResponse.json(
+      return Response.json(
         { error: "Invalid email or password." },
         { status: 401 }
       );
@@ -88,29 +105,29 @@ export async function POST(request: Request) {
       secret
     );
 
-    const response = NextResponse.json(
+    return Response.json(
       {
         id: user.id,
         email: user.email,
         name: user.name,
         role: user.role,
       },
-      { status: 200 }
+      {
+        status: 200,
+        headers: {
+          "Set-Cookie": serializeSessionCookie(token),
+        },
+      }
     );
-
-    // Set HttpOnly, SameSite=Lax, Secure cookie
-    response.cookies.set({
-      ...getSessionCookieOptions(),
-      value: token,
-    });
-
-    return response;
   } catch (error) {
-    // Avoid logging passwords, hashes, tokens, or secrets
     console.error("Login processing error occurred.");
-    return NextResponse.json(
+    return Response.json(
       { error: "An unexpected error occurred during login." },
       { status: 500 }
     );
   }
+}
+
+export async function POST(request: Request) {
+  return handleLogin(request);
 }

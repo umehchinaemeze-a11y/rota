@@ -1,8 +1,8 @@
 import { NextResponse } from "next/server";
 import { getSessionUser } from "@/lib/session";
 
-export async function GET() {
-  const sessionUser = await getSessionUser();
+export async function GET(request: Request) {
+  const sessionUser = await getSessionUser({ revalidateWithDb: true });
 
   if (!sessionUser) {
     return NextResponse.json(
@@ -20,6 +20,7 @@ export async function GET() {
         email: sessionUser.email,
         name: sessionUser.name,
         role: sessionUser.role,
+        teamId: sessionUser.teamId ?? null,
       },
     },
     { status: 200 }

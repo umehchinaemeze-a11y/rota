@@ -1,7 +1,7 @@
 import test, { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { handleCreateTeam, generateBaseSlug } from "../app/api/teams/route.ts";
+import { handleCreateTeam, handleGetTeams, generateBaseSlug } from "../app/api/teams/route.ts";
 import { verifySessionToken } from "../lib/auth.ts";
 import { canManageTeamShiftRecord } from "../lib/permissions.ts";
 
@@ -448,6 +448,74 @@ describe("Workspace Creation API Handler — Slug Collision & Database Failure H
     assert.equal(res.status, 500);
     const data = await res.json();
     assert.equal(data.error, "Unable to verify existing workspace memberships. Please try again.");
+    assert.doesNotMatch(JSON.stringify(data), /secret_pw/);
+    assert.doesNotMatch(JSON.stringify(data), /postgresql/);
+  });
+});
+
+describe("Workspace Listing API Handler — GET /api/teams", () => {
+  it("rejects unauthenticated requests with HTTP 401 Unauthorized", async () => {
+    const res = await handleGetTeams({
+      getSessionUser: async () => null,
+      sql: async () => [],
+    });
+
+    assert.equal(res.status, 401);
+    const data = await res.json();
+    assert.match(data.error, /Authentication required/);
+  });
+
+  it("returns authorized workspaces for the authenticated user", async () => {
+    const user = {
+      userId: 15,
+      email: "member@rota.local",
+      name: "Member User",
+      role: "Owner",
+      teamId: 10,
+    };
+
+    const mockTeams = [
+      { id: 10, name: "Alpha Clinic", slug: "alpha-clinic", role: "Owner", is_default: true },
+      { id: 12, name: "Beta Medical", slug: "beta-medical", role: "Staff", is_default: false },
+    ];
+
+    const res = await handleGetTeams({
+      getSessionUser: async () => user,
+      sql: async (strings) => {
+        if (strings.join("?").includes("FROM teams t")) {
+          return mockTeams;
+        }
+        return [];
+      },
+    });
+
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    assert.ok(Array.isArray(data.teams));
+    assert.equal(data.teams.length, 2);
+    assert.equal(data.teams[0].name, "Alpha Clinic");
+    assert.equal(data.teams[1].name, "Beta Medical");
+  });
+
+  it("returns HTTP 500 when database fails without leaking credentials", async () => {
+    const user = {
+      userId: 15,
+      email: "member@rota.local",
+      name: "Member User",
+      role: "Staff",
+      teamId: 10,
+    };
+
+    const res = await handleGetTeams({
+      getSessionUser: async () => user,
+      sql: async () => {
+        throw new Error("Connection terminated: postgresql://secret_user:secret_pw@host/db");
+      },
+    });
+
+    assert.equal(res.status, 500);
+    const data = await res.json();
+    assert.equal(data.error, "Failed to list workspaces.");
     assert.doesNotMatch(JSON.stringify(data), /secret_pw/);
     assert.doesNotMatch(JSON.stringify(data), /postgresql/);
   });
