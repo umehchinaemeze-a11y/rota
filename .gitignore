@@ -43,3 +43,7 @@ next-env.d.ts
 # ide
 .idea/
 *.iml
+
+# Temporary Cloudflare tunnel artifacts
+cloudflared.log
+tunnel-url.txt

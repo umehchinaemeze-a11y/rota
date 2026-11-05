@@ -4,6 +4,7 @@ import {
   globalBillingProcessor,
   getPlanPricing,
 } from "../../../lib/billing.ts";
+import { getPaystackPlan } from "../../../lib/paystack.ts";
 import {
   evaluateSeatCapacity,
   resolveSeatLimit,
@@ -43,7 +44,29 @@ export async function handleGetBillingStatus(
   }
 
   const processor = options?.processor || globalBillingProcessor;
-  const sub = processor.getSubscriptionByWorkspace(sessionUser.teamId);
+
+  let sub = null;
+  let ledger = [];
+  try {
+    sub =
+      typeof (processor as any).getSubscriptionByWorkspaceDurable === "function"
+        ? await (processor as any).getSubscriptionByWorkspaceDurable(sessionUser.teamId)
+        : processor.getSubscriptionByWorkspace(sessionUser.teamId);
+
+    ledger =
+      typeof (processor as any).getLedgerByWorkspaceDurable === "function"
+        ? await (processor as any).getLedgerByWorkspaceDurable(sessionUser.teamId)
+        : processor.getLedgerByWorkspace(sessionUser.teamId);
+  } catch {
+    return {
+      status: 500,
+      body: {
+        error: "Internal Server Error",
+        message: "Failed to retrieve billing status from persistent storage.",
+      },
+    };
+  }
+
   const tier = sub?.planId || "free";
   const seatLimit = sub?.seats || resolveSeatLimit(tier);
   const activeMembers = options?.activeMemberCount ?? 1;
@@ -55,12 +78,24 @@ export async function handleGetBillingStatus(
     seatLimit
   );
 
-  const ledger = processor.getLedgerByWorkspace(sessionUser.teamId);
+  const state =
+    !sub || sub.planId === "free"
+      ? "FREE"
+      : sub.status === "past_due"
+        ? "PAST_DUE"
+        : sub.status === "canceled"
+          ? "CANCELED"
+          : sub.status === "trialing"
+            ? "TRIALING"
+            : sub.status === "active"
+              ? "ACTIVE"
+              : String(sub.status).toUpperCase();
 
   return {
     status: 200,
     body: {
       workspaceId: sessionUser.teamId,
+      state,
       subscription: sub || {
         subscriptionId: null,
         workspaceId: sessionUser.teamId,
@@ -69,6 +104,7 @@ export async function handleGetBillingStatus(
         status: "active",
       },
       plan: getPlanPricing(tier),
+      paystackPlan: getPaystackPlan(tier),
       seatLimit,
       capacity,
       ledger,

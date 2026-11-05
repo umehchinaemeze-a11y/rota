@@ -15,6 +15,9 @@ import {
   sanitizeErrorMessage,
   sanitizeTargetHost,
   parseTargetCliArgs,
+  assertStagingDatabaseTarget,
+  EXPECTED_STAGING_HOSTNAME,
+  FORBIDDEN_PRODUCTION_HOSTNAME,
 } from "../scripts/db-target-guard.mjs";
 
 import {
@@ -601,5 +604,62 @@ describe("Database Safety Hardening — Subprocess Offline Execution & Guard Ver
     // Crucial check: Secret password is NOT printed anywhere
     assert.doesNotMatch(res.stdout, /super_secret_password_never_log/);
     assert.doesNotMatch(res.stderr, /super_secret_password_never_log/);
+  });
+});
+
+describe("Database Safety Hardening — Staging-Only Target Guard", () => {
+  it("confirms expected disposable staging hostname succeeds", () => {
+    const validStagingUrl = `postgresql://mock_user:mock_pw@${EXPECTED_STAGING_HOSTNAME}/neondb?sslmode=require`;
+    const res = assertStagingDatabaseTarget(validStagingUrl);
+    assert.equal(res.valid, true);
+    assert.equal(res.hostname, EXPECTED_STAGING_HOSTNAME);
+    assert.equal(res.database, "neondb");
+  });
+
+  it("CRITICAL GUARD: strictly rejects forbidden production hostname and throws fatal safety error", () => {
+    const prodUrl = `postgresql://mock_user:super_secret_pw@${FORBIDDEN_PRODUCTION_HOSTNAME}/neondb?sslmode=require`;
+    assert.throws(
+      () => assertStagingDatabaseTarget(prodUrl),
+      (err) => {
+        assert.match(err.message, /\[FATAL SAFETY STOP\]/);
+        assert.match(err.message, /FORBIDDEN PRODUCTION hostname/);
+        return true;
+      }
+    );
+  });
+
+  it("rejects unknown or arbitrary neon hostnames that are not the confirmed staging branch", () => {
+    const unknownHostUrl = "postgresql://mock_user:mock_pw@ep-unknown-branch-12345.c-7.us-east-2.aws.neon.tech/neondb";
+    assert.throws(
+      () => assertStagingDatabaseTarget(unknownHostUrl),
+      (err) => {
+        assert.match(err.message, /\[SAFETY GUARD\]/);
+        assert.match(err.message, /does not match EXPECTED STAGING hostname/);
+        return true;
+      }
+    );
+  });
+
+  it("rejects non-neondb databases even if staging hostname matches", () => {
+    const wrongDbUrl = `postgresql://mock_user:mock_pw@${EXPECTED_STAGING_HOSTNAME}/other_db?sslmode=require`;
+    assert.throws(
+      () => assertStagingDatabaseTarget(wrongDbUrl),
+      (err) => {
+        assert.match(err.message, /\[SAFETY GUARD\]/);
+        assert.match(err.message, /does not match expected staging database 'neondb'/);
+        return true;
+      }
+    );
+  });
+
+  it("rejects missing or empty database URLs fail-closed", () => {
+    assert.throws(
+      () => assertStagingDatabaseTarget(""),
+      /DATABASE_URL is not configured/
+    );
+    assert.throws(
+      () => assertStagingDatabaseTarget(null),
+      /DATABASE_URL is not configured/
+    );
   });
 });

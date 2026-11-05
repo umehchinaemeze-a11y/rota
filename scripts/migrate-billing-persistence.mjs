@@ -63,15 +63,19 @@ CREATE TABLE IF NOT EXISTS billing_events (
 );
 
 -- 3. Create billing_ledger table for immutable payment history
--- Relational invariant: transaction_id is VARCHAR UNIQUE NOT NULL
+-- Relational invariants:
+--   transaction_id is VARCHAR UNIQUE NOT NULL (immutable charge history)
+--   team_id REFERENCES teams(id) ON DELETE RESTRICT (financial audit history cannot be silently cascaded on team deletion)
+--   amount_cents stores exact integer smallest currency units (integer kobo for NGN, integer cents for historical USD)
+--   currency defaults to 'NGN' for approved Paystack billing model
 CREATE TABLE IF NOT EXISTS billing_ledger (
   id SERIAL PRIMARY KEY,
   transaction_id VARCHAR(255) UNIQUE NOT NULL,
-  team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+  team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE RESTRICT,
   event_id VARCHAR(255) REFERENCES billing_events(event_id) ON DELETE SET NULL,
   type VARCHAR(50) NOT NULL,
   amount_cents INTEGER NOT NULL,
-  currency VARCHAR(10) NOT NULL DEFAULT 'usd',
+  currency VARCHAR(10) NOT NULL DEFAULT 'NGN',
   status VARCHAR(50) NOT NULL,
   metadata JSONB,
   created_at TIMESTAMPTZ DEFAULT NOW()
@@ -84,6 +88,23 @@ CREATE INDEX IF NOT EXISTS idx_billing_events_event_id ON billing_events(event_i
 CREATE INDEX IF NOT EXISTS idx_billing_events_team_id ON billing_events(team_id);
 CREATE INDEX IF NOT EXISTS idx_billing_ledger_team_id ON billing_ledger(team_id);
 CREATE INDEX IF NOT EXISTS idx_billing_ledger_transaction_id ON billing_ledger(transaction_id);
+
+-- 5. Explicit reconciliation to guarantee pre-existing tables adopt corrected invariants
+ALTER TABLE billing_ledger
+  ALTER COLUMN currency SET DEFAULT 'NGN';
+
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.referential_constraints
+    WHERE constraint_name = 'billing_ledger_team_id_fkey'
+      AND delete_rule = 'CASCADE'
+  ) THEN
+    ALTER TABLE billing_ledger DROP CONSTRAINT billing_ledger_team_id_fkey;
+    ALTER TABLE billing_ledger ADD CONSTRAINT billing_ledger_team_id_fkey
+      FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE RESTRICT;
+  END IF;
+END $$;
 `;
 
 // Guarded Rollback Plan (Documented for explicit manual operator execution only)
@@ -111,7 +132,9 @@ export function printBillingDryRunNotice() {
   console.log("- Foreign keys link directly to teams(id INTEGER).");
   console.log("- Enforces UNIQUE (team_id) on workspace_subscriptions to prevent duplicate plans.");
   console.log("- Enforces UNIQUE (event_id) on billing_events for cross-instance idempotency.");
-  console.log("- Enforces UNIQUE (transaction_id) on billing_ledger for immutable charge history.\n");
+  console.log("- Enforces UNIQUE (transaction_id) on billing_ledger for immutable charge history.");
+  console.log("- Enforces ON DELETE RESTRICT on billing_ledger(team_id) to prevent accidental deletion of financial history.");
+  console.log("- Defaults currency to 'NGN' with integer kobo representation while preserving historical USD records.\n");
   console.log("Guarded Rollback Documentation:");
   console.log(ROLLBACK_PLAN_SQL);
   console.log("Notice: Hostname and database confirmation verifies operator intent, but does NOT");
@@ -234,8 +257,8 @@ async function main() {
   }
 
   // Dynamic import of Neon client only when --run and validation pass
-  const { Client } = await import("pg");
-  const client = new Client({ connectionString: databaseUrl });
+  const { Client } = await import("@neondatabase/serverless");
+  const client = new Client(databaseUrl);
 
   try {
     await client.connect();

@@ -360,3 +360,49 @@ export function parseTargetCliArgs(argv = process.argv, options = {}) {
     extraFlags,
   };
 }
+
+export const EXPECTED_STAGING_HOSTNAME = "ep-quiet-mode-b5gula0k-pooler.c-7.us-east-2.aws.neon.tech";
+export const FORBIDDEN_PRODUCTION_HOSTNAME = "ep-lingering-bread-b5kncjhq-pooler.c-7.us-east-2.aws.neon.tech";
+
+/**
+ * Asserts that the provided database URL targets the verified disposable staging branch only.
+ * Fails closed immediately if the URL matches the production hostname or any unexpected hostname.
+ *
+ * @param {string} databaseUrl - Connection string to validate
+ * @returns {{ valid: boolean, hostname: string, database: string }}
+ */
+export function assertStagingDatabaseTarget(databaseUrl) {
+  if (!databaseUrl || typeof databaseUrl !== "string" || databaseUrl.trim().length === 0) {
+    throw new Error("[SAFETY GUARD] DATABASE_URL is not configured.");
+  }
+
+  const hostname = extractHostname(databaseUrl);
+  if (!hostname) {
+    throw new Error("[SAFETY GUARD] Failed to extract valid hostname from configured DATABASE_URL.");
+  }
+
+  if (hostname === FORBIDDEN_PRODUCTION_HOSTNAME) {
+    throw new Error(
+      "[FATAL SAFETY STOP] Target database matches FORBIDDEN PRODUCTION hostname! All queries and operations aborted."
+    );
+  }
+
+  if (hostname !== EXPECTED_STAGING_HOSTNAME) {
+    throw new Error(
+      `[SAFETY GUARD] Target database hostname '${sanitizeTargetHost(hostname)}' does not match EXPECTED STAGING hostname. Expected '${sanitizeTargetHost(EXPECTED_STAGING_HOSTNAME)}'. All operations aborted.`
+    );
+  }
+
+  const database = extractDatabaseName(databaseUrl);
+  if (database.toLowerCase() !== "neondb") {
+    throw new Error(
+      `[SAFETY GUARD] Target database name '${database}' does not match expected staging database 'neondb'. All operations aborted.`
+    );
+  }
+
+  return {
+    valid: true,
+    hostname,
+    database,
+  };
+}

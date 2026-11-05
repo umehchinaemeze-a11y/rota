@@ -48,6 +48,17 @@ export function createLazyNeonClient(options: LazyNeonClientOptions = {}): NeonC
       const client = getClient();
       return Reflect.apply(client, client, args);
     },
+    get(target, prop, receiver) {
+      if (prop === "then" || prop === "name" || prop === "length" || typeof prop === "symbol" || prop in target) {
+        return Reflect.get(target, prop, receiver);
+      }
+      const client = getClient();
+      const value = Reflect.get(client, prop, receiver);
+      if (typeof value === "function") {
+        return value.bind(client);
+      }
+      return value;
+    },
   });
 }
 

@@ -19,35 +19,42 @@ function SignUpForm() {
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [checkingSession, setCheckingSession] = useState(true);
 
-  // Check if user is already authenticated
+  // Check if user is already authenticated in the background without blocking the form
   useEffect(() => {
     let isMounted = true;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 4000);
+
     async function checkAuth() {
       try {
-        const res = await fetch("/api/auth/me");
+        const res = await fetch("/api/auth/me", {
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
         if (res.ok) {
           const data = await res.json();
           if (data.authenticated && isMounted) {
             router.replace(redirectPath);
-            return;
           }
         }
       } catch {
-        // Continue to sign-up if session check fails
-      } finally {
-        if (isMounted) setCheckingSession(false);
+        // Continue to sign-up if session check fails, times out, or aborts
       }
     }
+
     void checkAuth();
+
     return () => {
       isMounted = false;
+      clearTimeout(timeoutId);
+      controller.abort();
     };
   }, [router, redirectPath]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (loading) return; // Prevent duplicate concurrent submissions
     setError(null);
 
     const trimmedName = name.trim();
@@ -111,36 +118,6 @@ function SignUpForm() {
       setLoading(false);
     }
   };
-
-  if (checkingSession) {
-    return (
-      <div className="flex min-h-[400px] items-center justify-center">
-        <div className="flex items-center gap-3 text-slate-500 text-sm font-medium">
-          <svg
-            className="h-5 w-5 animate-spin text-slate-700"
-            xmlns="http://www.w3.org/2000/svg"
-            fill="none"
-            viewBox="0 0 24 24"
-          >
-            <circle
-              className="opacity-25"
-              cx="12"
-              cy="12"
-              r="10"
-              stroke="currentColor"
-              strokeWidth="4"
-            ></circle>
-            <path
-              className="opacity-75"
-              fill="currentColor"
-              d="M4 12a8 8 0 018-8v8H4z"
-            ></path>
-          </svg>
-          Checking session…
-        </div>
-      </div>
-    );
-  }
 
   return (
     <form onSubmit={handleSubmit} className="space-y-4" noValidate>

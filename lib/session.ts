@@ -3,11 +3,19 @@ import { verifySessionToken, type SessionPayload } from "./auth.ts";
 export const SESSION_COOKIE_NAME = "rota_session";
 export const SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 7; // 7 days
 
-export function getSessionCookieOptions(maxAge: number = SESSION_MAX_AGE_SECONDS) {
+export function getSessionCookieOptions(
+  maxAge: number = SESSION_MAX_AGE_SECONDS,
+  req?: Request
+) {
+  const isSecure =
+    process.env.NODE_ENV === "production" ||
+    process.env.NEXT_PUBLIC_APP_URL?.startsWith("https://") ||
+    req?.headers?.get("x-forwarded-proto") === "https";
+
   return {
     name: SESSION_COOKIE_NAME,
     httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
+    secure: isSecure,
     sameSite: "lax" as const,
     path: "/",
     maxAge,
@@ -16,9 +24,14 @@ export function getSessionCookieOptions(maxAge: number = SESSION_MAX_AGE_SECONDS
 
 export function serializeSessionCookie(
   token: string,
-  maxAge: number = SESSION_MAX_AGE_SECONDS
+  maxAge: number = SESSION_MAX_AGE_SECONDS,
+  req?: Request
 ): string {
-  const secure = process.env.NODE_ENV === "production" ? "; Secure" : "";
+  const isSecure =
+    process.env.NODE_ENV === "production" ||
+    process.env.NEXT_PUBLIC_APP_URL?.startsWith("https://") ||
+    req?.headers?.get("x-forwarded-proto") === "https";
+  const secure = isSecure ? "; Secure" : "";
   return `${SESSION_COOKIE_NAME}=${token}; Path=/; Max-Age=${maxAge}; HttpOnly; SameSite=Lax${secure}`;
 }
 

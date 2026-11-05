@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "node --experimental-strip-types --test tests/shifts.test.mjs tests/proration.test.mjs tests/team-isolation.test.mjs tests/auth.test.mjs tests/billing-webhook.test.mjs tests/load-test-safety.test.mjs tests/database-safety-hardening.test.mjs tests/shift-recovery.test.mjs tests/billing-persistence.test.mjs tests/teams.test.mjs tests/default-membership-migration.test.mjs tests/db.test.mjs"
+    "test": "node --experimental-strip-types --test tests/shifts.test.mjs tests/proration.test.mjs tests/team-isolation.test.mjs tests/auth.test.mjs tests/billing-webhook.test.mjs tests/load-test-safety.test.mjs tests/database-safety-hardening.test.mjs tests/shift-recovery.test.mjs tests/billing-persistence.test.mjs tests/teams.test.mjs tests/default-membership-migration.test.mjs tests/db.test.mjs tests/paystack-phase1.test.mjs tests/paystack-storage.test.mjs tests/paystack-checkout.test.mjs tests/paystack-webhook.test.mjs tests/paystack-renewal.test.mjs tests/paystack-frontend.test.mjs"
   },
   "dependencies": {
     "@capacitor/android": "^8.5.3",

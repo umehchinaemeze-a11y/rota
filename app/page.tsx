@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { canManageTeamShiftRecord, isManagerRole, APP_ROLES } from "@/lib/permissions";
 import {
@@ -12,6 +12,10 @@ import {
   type ShiftRecoveryOutcome,
 } from "@/lib/shifts-client";
 import type { RecoverableShift } from "@/lib/shift-recovery";
+import {
+  resolveBillingVerificationBadge,
+  type PaymentProvider,
+} from "@/lib/billing-provider-badge";
 
 type AuthUser = {
   id: number;
@@ -56,6 +60,10 @@ export default function Home() {
 
   // Authentication states
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
+  const currentUserRef = useRef<AuthUser | null>(null);
+  useEffect(() => {
+    currentUserRef.current = currentUser;
+  }, [currentUser]);
   const [authLoading, setAuthLoading] = useState(true);
   const [showLoginModal, setShowLoginModal] = useState(false);
   const [loginEmail, setLoginEmail] = useState("");
@@ -118,6 +126,14 @@ export default function Home() {
   // Workspace Subscription & Billing states
   const [subscriptionPlan, setSubscriptionPlan] = useState<string>("free");
   const [subscriptionSeats, setSubscriptionSeats] = useState<number>(5);
+  const [subscriptionStatus, setSubscriptionStatus] = useState<string>("active");
+  const [paymentProvider, setPaymentProvider] = useState<PaymentProvider>(null);
+  const [autoRenewEnabled, setAutoRenewEnabled] = useState<boolean>(false);
+  const [cancelAtPeriodEnd, setCancelAtPeriodEnd] = useState<boolean>(false);
+  const [cardMetadata, setCardMetadata] = useState<{ brand?: string | null; last4?: string | null; bank?: string | null } | null>(null);
+  const [currentPeriodEnd, setCurrentPeriodEnd] = useState<number | null>(null);
+  const [gracePeriodExpiresAt, setGracePeriodExpiresAt] = useState<number | null>(null);
+  const [billingLedger, setBillingLedger] = useState<any[]>([]);
   const [showBillingModal, setShowBillingModal] = useState<boolean>(false);
   const [upgradingPlan, setUpgradingPlan] = useState<boolean>(false);
   const [billingError, setBillingError] = useState<string>("");
@@ -132,10 +148,14 @@ export default function Home() {
     { name: "Chika Nwosu", role: "Supervisor", status: "On shift", initials: "CN" },
   ]);
 
-  // Check authenticated session on load
+  // Check authenticated session on load with bounded timeout
   const checkSession = useCallback(async () => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 6000);
+
     try {
-      const res = await fetch("/api/auth/me");
+      const res = await fetch("/api/auth/me", { signal: controller.signal });
+      clearTimeout(timeoutId);
       if (res.ok) {
         const data = await res.json();
         if (data.authenticated && data.user) {
@@ -149,6 +169,7 @@ export default function Home() {
       setCurrentUser(null);
       return null;
     } finally {
+      clearTimeout(timeoutId);
       setAuthLoading(false);
     }
   }, []);
@@ -157,8 +178,12 @@ export default function Home() {
     setLoading(true);
     setError("");
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
+
     try {
-      const response = await fetch("/api/shifts");
+      const response = await fetch("/api/shifts", { signal: controller.signal });
+      clearTimeout(timeoutId);
       let body: unknown = null;
       try {
         body = await response.json();
@@ -196,6 +221,7 @@ export default function Home() {
       setError(outcome.status !== "success" ? outcome.message : "Failed to load shifts.");
       setStatusMessage("");
     } finally {
+      clearTimeout(timeoutId);
       setLoading(false);
     }
   }, []);
@@ -203,15 +229,19 @@ export default function Home() {
   // Check legacy shifts available for recovery
   const checkRecoverableShifts = useCallback(
     async (user?: AuthUser | null) => {
-      const targetUser = user !== undefined ? user : currentUser;
+      const targetUser = user !== undefined ? user : currentUserRef.current;
       if (!targetUser) {
         setRecoverableShifts([]);
         return;
       }
 
       setCheckingRecovery(true);
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 6000);
+
       try {
-        const res = await fetch("/api/shifts/recover");
+        const res = await fetch("/api/shifts/recover", { signal: controller.signal });
+        clearTimeout(timeoutId);
         if (res.status === 401) {
           setRecoverableShifts([]);
           return;
@@ -225,78 +255,172 @@ export default function Home() {
       } catch {
         setRecoverableShifts([]);
       } finally {
+        clearTimeout(timeoutId);
         setCheckingRecovery(false);
       }
     },
-    [currentUser]
+    []
   );
 
   const loadBillingStatus = useCallback(async (user?: AuthUser | null) => {
-    const targetUser = user !== undefined ? user : currentUser;
+    const targetUser = user !== undefined ? user : currentUserRef.current;
     if (!targetUser?.teamId) {
       setSubscriptionPlan("free");
       setSubscriptionSeats(5);
+      setSubscriptionStatus("active");
       return;
     }
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 6000);
+
     try {
-      const res = await fetch("/api/billing");
+      const res = await fetch("/api/billing", { signal: controller.signal });
+      clearTimeout(timeoutId);
       if (res.ok) {
         const data = await res.json();
-        if (data.subscription?.planId) {
-          setSubscriptionPlan(data.subscription.planId);
-          setSubscriptionSeats(data.subscription.seats || 5);
+        const sub = data.subscription;
+        if (sub) {
+          setSubscriptionPlan(sub.planId || "free");
+          setSubscriptionSeats(sub.seats || 5);
+          setSubscriptionStatus(sub.status || "active");
+          if (sub.paymentProvider === "paystack" || sub.paymentProvider === "stripe") {
+            setPaymentProvider(sub.paymentProvider);
+          } else {
+            setPaymentProvider(null);
+          }
+          setAutoRenewEnabled(!!sub.autoRenewEnabled);
+          setCancelAtPeriodEnd(!!sub.cancelAtPeriodEnd);
+          if (sub.cardLast4) {
+            setCardMetadata({
+              brand: sub.cardBrand,
+              last4: sub.cardLast4,
+              bank: sub.cardBank,
+            });
+          } else {
+            setCardMetadata(null);
+          }
+          setCurrentPeriodEnd(sub.currentPeriodEnd || null);
+          setGracePeriodExpiresAt(sub.gracePeriodExpiresAt || null);
+        }
+        if (Array.isArray(data.ledger)) {
+          setBillingLedger(data.ledger);
+        }
+      } else {
+        if (res.status === 401) {
+          setBillingError("Authentication required: please sign in to view billing.");
+        } else if (res.status === 403) {
+          setBillingError("Access denied: only workspace owners or managers can access billing.");
+        } else {
+          setBillingError("Unable to verify workspace subscription state from server.");
         }
       }
-    } catch {
-      // Graceful fallback to default free tier
+    } catch (err: any) {
+      if (err?.name === "AbortError") {
+        setBillingError("Billing verification timed out. Please check your network connection.");
+      } else {
+        setBillingError("Network error: failed to verify subscription state.");
+      }
+    } finally {
+      clearTimeout(timeoutId);
     }
-  }, [currentUser]);
+  }, []);
 
   const handleUpgradePlan = async (targetPlan: string) => {
     setUpgradingPlan(true);
     setBillingError("");
 
     try {
-      const res = await fetch("/api/billing/checkout", {
+      const res = await fetch("/api/billing/paystack/initialize", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           workspaceId: currentUser?.teamId,
           targetPlan,
+          callbackUrl: typeof window !== "undefined" ? window.location.origin + window.location.pathname : undefined,
         }),
       });
 
       const data = await res.json();
       if (!res.ok) {
-        setBillingError(data.message || "Failed to initialize checkout.");
+        if (res.status === 401) {
+          setBillingError(data.message || "Authentication required to initiate checkout.");
+        } else if (res.status === 403) {
+          setBillingError(data.message || "Access denied: only workspace owners or managers can initiate checkout.");
+        } else if (res.status === 502) {
+          setBillingError(data.message || "Payment gateway unavailable. Please try again shortly.");
+        } else {
+          setBillingError(data.message || "Failed to verify current subscription state.");
+        }
         return;
       }
 
-      if (data.sessionId) {
-        // In test mode / mock mode, immediately verify and confirm payment server-side
-        const confirmRes = await fetch("/api/billing/confirm", {
+      // If a real external Paystack checkout URL is returned (e.g. on staging with live Paystack), redirect customer
+      if (
+        data.authorizationUrl &&
+        typeof data.authorizationUrl === "string" &&
+        data.authorizationUrl.startsWith("http") &&
+        !data.authorizationUrl.includes("mock") &&
+        !data.authorizationUrl.includes("localhost")
+      ) {
+        window.location.href = data.authorizationUrl;
+        return;
+      }
+
+      if (data.reference) {
+        // In local offline / mock test mode, immediately verify and confirm payment server-side
+        const verifyRes = await fetch("/api/billing/paystack/verify", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sessionId: data.sessionId }),
+          body: JSON.stringify({ reference: data.reference }),
         });
 
-        const confirmData = await confirmRes.json();
-        if (confirmRes.ok && confirmData.success) {
-          setSubscriptionPlan(confirmData.subscription?.planId || targetPlan);
-          setSubscriptionSeats(confirmData.subscription?.seats || data.seats || 15);
+        const verifyData = await verifyRes.json();
+        if (verifyRes.ok && verifyData.success) {
+          setSubscriptionPlan(verifyData.subscription?.planId || targetPlan);
+          setSubscriptionSeats(verifyData.subscription?.seats || data.seats || 15);
+          setSubscriptionStatus(verifyData.subscription?.status || "active");
+          setPaymentProvider(verifyData.subscription?.paymentProvider || "paystack");
+          setAutoRenewEnabled(!!verifyData.subscription?.autoRenewEnabled);
           setShowBillingModal(false);
           setNotice(
             `Workspace subscription successfully upgraded to ${targetPlan.toUpperCase()} tier (${
-              confirmData.subscription?.seats || data.seats
+              verifyData.subscription?.seats || data.seats
             } seats).`
           );
+          await loadBillingStatus();
         } else {
-          setBillingError(confirmData.message || "Payment confirmation failed.");
+          setBillingError(verifyData.message || "Payment verification failed.");
         }
       }
     } catch (err: any) {
       setBillingError(err?.message || "Failed to connect to billing service.");
+    } finally {
+      setUpgradingPlan(false);
+    }
+  };
+
+  const handleCancelSubscription = async () => {
+    setUpgradingPlan(true);
+    setBillingError("");
+
+    try {
+      const res = await fetch("/api/billing/paystack/cancel", {
+        method: "POST",
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        setCancelAtPeriodEnd(true);
+        setAutoRenewEnabled(false);
+        setNotice(
+          "Subscription auto-renewal canceled. Your team access and schedule remain intact until the end of your billing cycle."
+        );
+        await loadBillingStatus();
+      } else {
+        setBillingError(data.message || "Failed to cancel subscription.");
+      }
+    } catch (err: any) {
+      setBillingError(err?.message || "Failed to cancel subscription.");
     } finally {
       setUpgradingPlan(false);
     }
@@ -307,26 +431,38 @@ export default function Home() {
     let active = true;
 
     async function initialize() {
-      const user = await checkSession();
-      if (active) {
-        await loadShifts();
-        if (user) {
-          await checkRecoverableShifts(user);
-          await loadBillingStatus(user);
+      try {
+        const user = await checkSession();
+        if (!active) return;
 
-          // Check if returning from checkout with session_id parameter
+        if (user) {
+          await loadShifts();
+          if (!active) return;
+
+          // Non-blocking parallel execution for independent workspace features
+          await Promise.allSettled([
+            checkRecoverableShifts(user),
+            loadBillingStatus(user),
+          ]);
+          if (!active) return;
+
+          // Check if returning from checkout with reference (Paystack)
           if (typeof window !== "undefined") {
             const params = new URLSearchParams(window.location.search);
-            const sessionId = params.get("session_id");
-            if (sessionId) {
+            const pstkRef = params.get("reference") || params.get("trxref");
+            const pstkStatus = params.get("status");
+
+            if (pstkStatus === "cancelled" || pstkStatus === "failed") {
+              setNotice("Paystack payment checkout was cancelled or failed. No charges were made.");
+            } else if (pstkRef) {
               try {
-                const confirmRes = await fetch("/api/billing/confirm", {
+                const verifyRes = await fetch("/api/billing/paystack/verify", {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ sessionId }),
+                  body: JSON.stringify({ reference: pstkRef }),
                 });
-                const confirmData = await confirmRes.json();
-                if (confirmRes.ok && confirmData.success) {
+                const verifyData = await verifyRes.json();
+                if (verifyRes.ok && verifyData.success && active) {
                   setNotice("Payment verified! Your workspace subscription has been updated.");
                   await loadBillingStatus(user);
                 }
@@ -335,6 +471,26 @@ export default function Home() {
               }
             }
           }
+        } else {
+          // Unauthenticated: set unauthenticated state safely
+          setSchedule([]);
+          setShiftLoadStatus("unauthenticated");
+          setStatusMessage("Sign in required to view shifts. Please sign in to access your team schedule.");
+          setLoading(false);
+          setSubscriptionPlan("free");
+          setSubscriptionSeats(5);
+          setSubscriptionStatus("active");
+          setPaymentProvider(null);
+          setRecoverableShifts([]);
+        }
+      } catch {
+        if (active) {
+          setShiftLoadStatus("network_error");
+          setError("Failed to initialize workspace data.");
+        }
+      } finally {
+        if (active) {
+          setLoading(false);
         }
       }
     }
@@ -1157,12 +1313,22 @@ export default function Home() {
                   Account Status
                 </p>
                 <p className="mt-2 text-lg font-bold text-slate-900">
-                  {currentUser ? currentUser.role : "Signed Out"}
+                  {authLoading ? (
+                    <span className="text-slate-400 font-normal text-sm">Checking…</span>
+                  ) : currentUser ? (
+                    currentUser.role
+                  ) : (
+                    "Signed Out"
+                  )}
                 </p>
                 <p className="mt-1 text-xs text-slate-500">
-                  {currentUser
-                    ? `Authenticated as ${currentUser.name}`
-                    : "Sign in required to view shifts"}
+                  {authLoading ? (
+                    "Verifying session status…"
+                  ) : currentUser ? (
+                    `Authenticated as ${currentUser.name}`
+                  ) : (
+                    "Sign in required to view shifts"
+                  )}
                 </p>
               </div>
             </div>
@@ -1332,7 +1498,7 @@ export default function Home() {
                           Workspace Subscription &amp; Billing
                         </h3>
                         <p className="text-xs text-slate-500 mt-0.5">
-                          Manage workspace seat capacity and billing tiers powered by Stripe test-mode integration.
+                          Manage workspace seat capacity and billing tiers powered by Paystack test-mode integration.
                         </p>
                       </div>
                       {currentUser && isManager && (
@@ -1341,6 +1507,7 @@ export default function Home() {
                           onClick={() => {
                             setBillingError("");
                             setShowBillingModal(true);
+                            loadBillingStatus();
                           }}
                           className="rounded-xl bg-slate-900 px-3.5 py-2 text-xs font-semibold text-white hover:bg-slate-800 transition shadow-xs"
                         >
@@ -1362,8 +1529,26 @@ export default function Home() {
                         </span>
                       </div>
                       <div className="mt-2.5 text-[11px] text-slate-500 border-t border-slate-200 pt-2 flex items-center justify-between">
+                        <span>Payment Gateway:</span>
+                        <span className="font-medium text-slate-700">
+                          Paystack Test Mode (Configured)
+                        </span>
+                      </div>
+                      <div className="mt-2 text-[11px] text-slate-500 flex items-center justify-between">
                         <span>Server-Side Payment Verification:</span>
-                        <span className="text-emerald-700 font-medium">Authoritative · Verified via Stripe</span>
+                        {(() => {
+                          const badge = resolveBillingVerificationBadge({
+                            planId: subscriptionPlan,
+                            paymentProvider,
+                            subscriptionStatus,
+                            ledger: billingLedger,
+                          });
+                          return (
+                            <span className={badge.className}>
+                              {badge.text}
+                            </span>
+                          );
+                        })()}
                       </div>
                     </div>
                   </div>
@@ -1526,9 +1711,24 @@ export default function Home() {
                 </div>
 
                 {loading ? (
-                  <p className="mt-5 rounded-xl border border-slate-200 bg-white p-6 text-sm text-slate-500">
-                    Loading shifts from database…
-                  </p>
+                  <div className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-3 animate-pulse" aria-label="Loading shifts">
+                    {[1, 2, 3].map((skeletonIdx) => (
+                      <div
+                        key={skeletonIdx}
+                        className="rounded-2xl border border-slate-200 bg-white p-5 shadow-xs space-y-3"
+                      >
+                        <div className="flex items-center justify-between">
+                          <div className="h-4 w-28 bg-slate-200 rounded-md"></div>
+                          <div className="h-5 w-16 bg-slate-100 rounded-full"></div>
+                        </div>
+                        <div className="h-3.5 w-36 bg-slate-100 rounded-md"></div>
+                        <div className="pt-2 border-t border-slate-100 flex items-center justify-between">
+                          <div className="h-3 w-20 bg-slate-100 rounded-md"></div>
+                          <div className="h-6 w-14 bg-slate-100 rounded-lg"></div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
                 ) : shiftLoadStatus === "unauthenticated" ? (
                   <div className="mt-5 rounded-2xl border border-slate-200 bg-white p-8 text-center shadow-sm">
                     <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-slate-100 text-xl">
@@ -2428,29 +2628,93 @@ export default function Home() {
               </button>
             </div>
 
+            {/* Active Subscription & Grace Period Alerts */}
+            {subscriptionStatus === "past_due" && (
+              <div className="mb-4 rounded-xl border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900 flex items-start gap-2">
+                <span className="text-base leading-none">⚠️</span>
+                <div>
+                  <p className="font-semibold">Renewal Payment Past Due</p>
+                  <p className="text-amber-800 mt-0.5">
+                    Your last renewal charge failed. Your team is currently in a 7-day grace period
+                    {gracePeriodExpiresAt ? ` (expires on ${new Date(gracePeriodExpiresAt * 1000).toLocaleDateString()})` : ""}.
+                    Select a plan below to refresh your card and keep your workspace active.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {cancelAtPeriodEnd && (
+              <div className="mb-4 rounded-xl border border-blue-200 bg-blue-50 p-3 text-xs text-blue-900">
+                <p className="font-semibold">Auto-Renewal Canceled</p>
+                <p className="text-blue-800 mt-0.5">
+                  Your subscription will not renew automatically. You have full access to your plan until
+                  {currentPeriodEnd ? ` ${new Date(currentPeriodEnd * 1000).toLocaleDateString()}` : " the end of your billing cycle"}.
+                </p>
+              </div>
+            )}
+
+            {/* Current Subscription & Payment Method Summary */}
+            {subscriptionPlan !== "free" && (
+              <div className="mb-4 rounded-xl border border-slate-200 bg-slate-50 p-3.5 text-xs text-slate-700 space-y-1.5">
+                <div className="flex items-center justify-between font-semibold text-slate-900">
+                  <span>Current Subscription</span>
+                  <span className={`px-2 py-0.5 rounded text-[11px] font-bold uppercase ${
+                    subscriptionStatus === "active" ? "bg-emerald-100 text-emerald-800" :
+                    subscriptionStatus === "past_due" ? "bg-amber-100 text-amber-800" :
+                    "bg-slate-200 text-slate-700"
+                  }`}>
+                    {subscriptionStatus}
+                  </span>
+                </div>
+                {cardMetadata?.last4 && (
+                  <p className="text-slate-600">
+                    💳 Payment Card: <span className="font-medium text-slate-800">{cardMetadata.brand ? cardMetadata.brand.toUpperCase() : "Card"} ending in {cardMetadata.last4}</span>
+                    {cardMetadata.bank ? ` (${cardMetadata.bank})` : ""}
+                  </p>
+                )}
+                {currentPeriodEnd && (
+                  <p className="text-slate-600">
+                    🗓️ Next Billing Date: <span className="font-medium text-slate-800">{new Date(currentPeriodEnd * 1000).toLocaleDateString()}</span>
+                  </p>
+                )}
+                {!cancelAtPeriodEnd && subscriptionStatus === "active" && (
+                  <div className="pt-1 flex justify-end">
+                    <button
+                      type="button"
+                      disabled={upgradingPlan}
+                      onClick={handleCancelSubscription}
+                      className="text-[11px] font-semibold text-rose-600 hover:text-rose-700 underline disabled:opacity-50"
+                    >
+                      Cancel Auto-Renewal
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
             {billingError && (
               <div className="mb-4 rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-800">
                 {billingError}
               </div>
             )}
 
-            <div className="space-y-3 mb-6">
-              {/* Starter Plan Card */}
+            <div className="space-y-3 mb-4">
+              {/* Starter Plan Card (₦15,000 / 15 seats) */}
               <div
                 className={`rounded-xl border p-4 transition ${
                   subscriptionPlan === "starter"
-                    ? "border-lime-500 bg-lime-50/40"
+                    ? "border-emerald-500 bg-emerald-50/40"
                     : "border-slate-200 bg-white hover:border-slate-300"
                 }`}
               >
                 <div className="flex items-center justify-between">
                   <div>
                     <h3 className="font-bold text-slate-900">Starter Tier</h3>
-                    <p className="text-xs text-slate-500">For small clinics and growing teams</p>
+                    <p className="text-xs text-slate-500">For small clinics and growing healthcare teams</p>
                   </div>
                   <div className="text-right">
-                    <p className="text-lg font-bold text-slate-900">$29<span className="text-xs text-slate-500 font-normal">/mo</span></p>
-                    <span className="inline-block text-[11px] font-semibold text-lime-800 bg-lime-100 px-2 py-0.5 rounded">
+                    <p className="text-lg font-bold text-slate-900">₦15,000<span className="text-xs text-slate-500 font-normal">/mo</span></p>
+                    <span className="inline-block text-[11px] font-semibold text-emerald-800 bg-emerald-100 px-2 py-0.5 rounded">
                       Up to 15 seats
                     </span>
                   </div>
@@ -2461,26 +2725,26 @@ export default function Home() {
                   onClick={() => handleUpgradePlan("starter")}
                   className="mt-3 w-full rounded-xl bg-slate-900 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50 transition"
                 >
-                  {subscriptionPlan === "starter" ? "Current Plan" : "Select Starter Plan"}
+                  {subscriptionPlan === "starter" ? "Current Plan" : "Upgrade to Starter (₦15,000/mo)"}
                 </button>
               </div>
 
-              {/* Pro Plan Card */}
+              {/* Pro Plan Card (₦45,000 / 50 seats) */}
               <div
                 className={`rounded-xl border p-4 transition ${
                   subscriptionPlan === "pro"
-                    ? "border-lime-500 bg-lime-50/40"
+                    ? "border-emerald-500 bg-emerald-50/40"
                     : "border-slate-200 bg-white hover:border-slate-300"
                 }`}
               >
                 <div className="flex items-center justify-between">
                   <div>
                     <h3 className="font-bold text-slate-900">Professional Tier</h3>
-                    <p className="text-xs text-slate-500">For multi-department medical centers</p>
+                    <p className="text-xs text-slate-500">For multi-department medical centers & clinics</p>
                   </div>
                   <div className="text-right">
-                    <p className="text-lg font-bold text-slate-900">$79<span className="text-xs text-slate-500 font-normal">/mo</span></p>
-                    <span className="inline-block text-[11px] font-semibold text-lime-800 bg-lime-100 px-2 py-0.5 rounded">
+                    <p className="text-lg font-bold text-slate-900">₦45,000<span className="text-xs text-slate-500 font-normal">/mo</span></p>
+                    <span className="inline-block text-[11px] font-semibold text-emerald-800 bg-emerald-100 px-2 py-0.5 rounded">
                       Up to 50 seats
                     </span>
                   </div>
@@ -2491,26 +2755,26 @@ export default function Home() {
                   onClick={() => handleUpgradePlan("pro")}
                   className="mt-3 w-full rounded-xl bg-slate-900 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50 transition"
                 >
-                  {subscriptionPlan === "pro" ? "Current Plan" : "Select Professional Plan"}
+                  {subscriptionPlan === "pro" ? "Current Plan" : "Upgrade to Professional (₦45,000/mo)"}
                 </button>
               </div>
 
-              {/* Enterprise Plan Card */}
+              {/* Enterprise Plan Card (₦150,000 / 500 seats) */}
               <div
                 className={`rounded-xl border p-4 transition ${
                   subscriptionPlan === "enterprise"
-                    ? "border-lime-500 bg-lime-50/40"
+                    ? "border-emerald-500 bg-emerald-50/40"
                     : "border-slate-200 bg-white hover:border-slate-300"
                 }`}
               >
                 <div className="flex items-center justify-between">
                   <div>
                     <h3 className="font-bold text-slate-900">Enterprise Tier</h3>
-                    <p className="text-xs text-slate-500">For regional hospital networks</p>
+                    <p className="text-xs text-slate-500">For regional hospital networks & hospital groups</p>
                   </div>
                   <div className="text-right">
-                    <p className="text-lg font-bold text-slate-900">$299<span className="text-xs text-slate-500 font-normal">/mo</span></p>
-                    <span className="inline-block text-[11px] font-semibold text-lime-800 bg-lime-100 px-2 py-0.5 rounded">
+                    <p className="text-lg font-bold text-slate-900">₦150,000<span className="text-xs text-slate-500 font-normal">/mo</span></p>
+                    <span className="inline-block text-[11px] font-semibold text-emerald-800 bg-emerald-100 px-2 py-0.5 rounded">
                       Up to 500 seats
                     </span>
                   </div>
@@ -2521,13 +2785,21 @@ export default function Home() {
                   onClick={() => handleUpgradePlan("enterprise")}
                   className="mt-3 w-full rounded-xl bg-slate-900 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50 transition"
                 >
-                  {subscriptionPlan === "enterprise" ? "Current Plan" : "Select Enterprise Plan"}
+                  {subscriptionPlan === "enterprise" ? "Current Plan" : "Upgrade to Enterprise (₦150,000/mo)"}
                 </button>
               </div>
             </div>
 
+            {/* Invariant & Data Preservation Guarantees */}
+            <div className="rounded-xl border border-slate-100 bg-slate-50 p-3 mb-4 text-[11px] text-slate-500 space-y-1">
+              <p className="font-medium text-slate-700">🔒 Security & Policy Guarantees:</p>
+              <p>• Billed monthly in Nigerian Naira (NGN) via Paystack encrypted checkout.</p>
+              <p>• Data Preservation: Changing plans never deletes workspace members, roles, or shifts.</p>
+              <p>• Cancel anytime to stop future renewals while maintaining access until period end.</p>
+            </div>
+
             <div className="border-t border-slate-100 pt-3 flex justify-between items-center text-xs text-slate-400">
-              <span>Test Mode · Server-Side Payment Verification</span>
+              <span>Paystack Secured · Reusable Authorization</span>
               <button
                 type="button"
                 onClick={() => {

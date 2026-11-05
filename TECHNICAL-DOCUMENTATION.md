@@ -51,12 +51,17 @@ rota/web/
 │   │   │   └── me/
 │   │   │       └── route.ts          # GET /api/auth/me (Sanitized user profile inspection)
 │   │   ├── billing/
-│   │   │   ├── checkout/
-│   │   │   │   └── route.ts          # POST /api/billing/checkout (Authenticated Checkout Session creation & proration)
-│   │   │   ├── confirm/
-│   │   │   │   └── route.ts          # POST /api/billing/confirm (Authoritative server-side payment verification & ledger)
-│   │   │   ├── webhook/
-│   │   │   │   └── route.ts          # POST /api/billing/webhook (HMAC-verified Stripe lifecycle event ingestion)
+│   │   │   ├── paystack/
+│   │   │   │   ├── cancel/
+│   │   │   │   │   └── route.ts          # POST /api/billing/paystack/cancel (Merchant-managed cancellation & auto-renew stop)
+│   │   │   │   ├── initialize/
+│   │   │   │   │   └── route.ts          # POST /api/billing/paystack/initialize (NGN kobo checkout initialization & unique reference)
+│   │   │   │   ├── renew/
+│   │   │   │   │   └── route.ts          # POST /api/billing/paystack/renew (Off-session recurring renewal execution engine)
+│   │   │   │   ├── verify/
+│   │   │   │   │   └── route.ts          # POST /api/billing/paystack/verify (Authoritative gateway verification & AES-256-GCM auth encryption)
+│   │   │   │   └── webhook/
+│   │   │   │       └── route.ts          # POST /api/billing/paystack/webhook (HMAC-SHA512 Paystack webhook ingestion & deduplication)
 │   │   │   └── route.ts              # GET /api/billing (Workspace subscription, seat limits & ledger status)
 │   │   └── shifts/
 │   │       ├── [id]/
@@ -70,16 +75,20 @@ rota/web/
 │   └── page.tsx                      # Primary client-rendered dashboard, schedule grid, billing modal & auth modals
 ├── lib/
 │   ├── auth.ts                       # Cryptographic primitives: scrypt hashing and HMAC-SHA256 tokens
+│   ├── billing-calendar.ts           # Calendar-month renewal date calculations with leap year & month boundary safety
+│   ├── billing-provider-badge.ts     # Verification badge resolver reflecting authoritative active provider & legacy history
 │   ├── billing-storage.ts            # Durable persistence contracts, in-memory mock & PostgreSQL storage adapters
 │   ├── billing.ts                    # Billing event processor, idempotency cache, plan pricing & ledger management
 │   ├── db.ts                         # Neon PostgreSQL connection pool and SQL template tag export
+│   ├── paystack-renewal-engine.ts    # Off-session recurring charge worker with renewal lease locks & reconciliation
+│   ├── paystack-security.ts          # AES-256-GCM encryption of reusable authorization codes & HMAC-SHA512 verification
+│   ├── paystack.ts                   # Commercial NGN pricing tiers and Paystack gateway client
 │   ├── permissions.ts                # Server-side authorization matrix and canManageShiftRecord logic
 │   ├── proration.ts                  # Pure mathematical proration calculation engine
 │   ├── seat-limit.ts                 # Workspace seat capacity evaluation & concurrency guard
 │   ├── session.ts                    # HttpOnly cookie management and database-revalidated session resolution
 │   ├── shift-recovery.ts             # Safe legacy shift recovery, workspace authorization, and row locking
-│   ├── shifts-client.ts              # Pure client-side shift recovery HTTP response resolvers
-│   └── stripe.ts                     # Stripe API client with test-mode mock implementation (zero external dependencies)
+│   └── shifts-client.ts              # Pure client-side shift recovery HTTP response resolvers
 ├── scripts/                          # Administrative maintenance & migration scripts (dry-run guarded)
 │   ├── migrate-billing-persistence.mjs # Durable billing schema migration (workspace_subscriptions, billing_events, billing_ledger)
 │   └── migrate-team-isolation.mjs    # Multi-tenant workspace isolation migration
@@ -189,68 +198,76 @@ rota/web/
     * `404 Not Found`: If one or more requested shift IDs do not exist.
     * `409 Conflict`: If one or more requested shifts are already assigned to a workspace.
 
-### 4.4 Billing & Payment Endpoints (Test Mode)
+### 4.4 Billing & Payment Endpoints (Paystack Exclusive)
 
-* **`POST /api/billing/checkout`**
+* **`POST /api/billing/paystack/initialize`**
   * **Access:** Authenticated managers and workspace owners only (`isManagerRole(sessionUser.role) || sessionUser.teamRole === "Owner"`).
-  * **Payload:** `{ "planId": "pro" | "enterprise", "workspaceId"?: number }`.
+  * **Payload:** `{ "targetPlan": "starter" | "pro" | "enterprise", "seats"?: number, "workspaceId"?: number }`.
   * **Processing:**
     1. Validates session, active workspace (`sessionUser.teamId`), and managerial authorization.
-    2. Validates workspace isolation: ensures requested `workspaceId` exactly matches `sessionUser.teamId`.
-    3. Validates target plan against `PLAN_PRICING` (`starter`, `pro`, `enterprise`). Rejects free tier or unknown plans with `400 Bad Request`.
-    4. Evaluates current subscription. If upgrading from an active paid tier mid-cycle, computes prorated amount using `calculatePlanProration()` from `lib/proration.ts`.
-    5. Calls `stripeClient.createCheckoutSession()` to generate a test-mode checkout session URL and ID with embedded metadata (`workspace_id`, `plan_id`, `user_id`).
+    2. Validates workspace isolation: ensures requested `workspaceId` matches `sessionUser.teamId`.
+    3. Validates target plan against `PAYSTACK_PLANS` (`starter`, `pro`, `enterprise`). Rejects free tier or unknown plans with `400 Bad Request`.
+    4. Evaluates current subscription. Prevents duplicate checkout if workspace is already actively subscribed to the target plan.
+    5. Calls `paystackClient.initializeTransaction()` with server-enforced integer kobo pricing and deterministic reference (`pstk_init_{teamId}_{plan}_{timestamp}_{suffix}`).
   * **Responses:**
-    * `200 OK`: Returns `{ "sessionId": "cs_test_...", "url": "https://checkout.stripe.com/c/pay/cs_test_...", "planId": "pro", "amount": 7900, "isProrated": false }`.
+    * `200 OK`: Returns `{ "authorizationUrl": "https://checkout.paystack.com/...", "accessCode": "...", "reference": "pstk_init_...", "amountKobo": 1500000, "currency": "NGN" }`.
     * `400 Bad Request`: If plan is missing, invalid, or already active.
     * `401 Unauthorized`: If user is not authenticated.
-    * `403 Forbidden`: If user has no workspace or lacks manager permissions, or target workspace ID mismatches.
+    * `403 Forbidden`: If user lacks management authority or target workspace mismatches.
 
-* **`POST /api/billing/confirm`**
+* **`POST /api/billing/paystack/verify`**
   * **Access:** Authenticated users belonging to an active workspace.
-  * **Payload:** `{ "sessionId": "cs_test_..." }`.
+  * **Payload:** `{ "reference": "pstk_init_..." }`.
   * **Processing (Strict Server-Side Verification):**
-    1. **Never trusts client status or amount:** Any client-supplied `amount`, `status`, or `planId` in the request body is discarded.
-    2. Directly queries Stripe API / `MockStripeClient` via `stripeClient.retrieveCheckoutSession(sessionId)`.
-    3. Verifies `payment_status === "paid"`. Rejects incomplete or unpaid sessions with `422 Unprocessable Entity`.
-    4. Enforces workspace isolation: verifies `session.metadata.workspace_id === sessionUser.teamId`. Rejects cross-tenant session claims with `403 Forbidden`.
-    5. Activates subscription in `globalBillingProcessor` (`active` status, seat limit updated).
-    6. Records ledger entry with transaction amount, plan ID, session ID, and timestamp.
-    7. Fully idempotent: repeated confirmation attempts return `200 OK` with `alreadyConfirmed: true` without creating duplicate ledger records.
+    1. Directly queries Paystack API / `defaultPaystackClient` via `paystackClient.verifyTransaction(reference)`.
+    2. Verifies `status === "success"`, `currency === "NGN"`, and `amount === expectedKobo`.
+    3. Enforces workspace isolation: verifies `metadata.workspace_id === sessionUser.teamId`.
+    4. If reusable authorization is returned, encrypts authorization code via AES-256-GCM (`lib/paystack-security.ts`) and sets `auto_renew_enabled = TRUE`.
+    5. Activates subscription in durable PostgreSQL storage (`workspace_subscriptions`).
+    6. Records immutable ledger entry (`billing_ledger`) and audit event (`billing_events`).
+    7. Fully idempotent: repeated verification attempts return `200 OK` with `alreadyVerified: true` without duplicate ledger records.
   * **Responses:**
-    * `200 OK`: Returns `{ "success": true, "planId": "pro", "seatLimit": 50, "status": "active" }`.
-    * `400 Bad Request`: If `sessionId` is missing or empty.
+    * `200 OK`: Returns `{ "success": true, "subscription": { ... } }`.
+    * `400 Bad Request`: If `reference` is missing or invalid.
     * `401 Unauthorized`: If caller is not authenticated.
-    * `403 Forbidden`: If checkout session belongs to another tenant.
-    * `404 Not Found`: If session does not exist on Stripe.
-    * `422 Unprocessable Entity`: If session has not been successfully paid.
+    * `403 Forbidden`: If transaction belongs to another workspace.
+    * `422 Unprocessable Entity`: If transaction has not succeeded.
+
+* **`POST /api/billing/paystack/webhook`**
+  * **Access:** Unauthenticated HTTP POST from Paystack webhook infrastructure.
+  * **Processing:**
+    1. Validates `PAYSTACK_SECRET_KEY` is configured (returns `503` if unconfigured).
+    2. Validates `x-paystack-signature` HMAC-SHA512 header using `crypto.timingSafeEqual`.
+    3. Deduplicates incoming events in `billing_events` table by unique event reference.
+    4. Dispatches event (`charge.success`, `subscription.disable`, etc.), updating durable subscription state idempotently.
+  * **Responses:**
+    * `200 OK`: Returns `{ "received": true, "duplicate": boolean }`.
+    * `400 Bad Request`: If signature is missing, forged, or payload is empty.
+    * `503 Service Unavailable`: If `PAYSTACK_SECRET_KEY` is unconfigured.
+
+* **`POST /api/billing/paystack/cancel`**
+  * **Access:** Authenticated managers and workspace owners.
+  * **Processing:** Sets `cancel_at_period_end = TRUE` and `auto_renew_enabled = FALSE` without destroying workspace members or shift history.
+  * **Responses:**
+    * `200 OK`: Returns `{ "success": true, "message": "Subscription auto-renewal canceled." }`.
+
+* **`POST /api/billing/paystack/renew`**
+  * **Access:** Authenticated worker trigger protected by `CRON_SECRET` Bearer authorization.
+  * **Processing:** Executes off-session recurring renewal charges using stored AES-256-GCM encrypted authorization codes with PostgreSQL renewal lease locks and calendar-month anchor day math.
 
 * **`GET /api/billing`**
   * **Access:** Authenticated users belonging to an active workspace.
-  * **Processing:** Retrieves active subscription for `sessionUser.teamId`, queries active workspace member count from `team_memberships`, evaluates seat capacity via `evaluateSeatCapacity()`, and fetches ledger transaction history.
+  * **Processing:** Retrieves active subscription for `sessionUser.teamId` from durable storage, evaluates seat capacity, and returns commercial NGN plan configuration and billing ledger history.
   * **Responses:**
-    * `200 OK`: Returns `{ "plan": "starter" | "pro" | "enterprise" | "free", "status": "active", "seatLimit": N, "activeMembers": N, "availableSeats": N, "isOverLimit": false, "history": [ ... ] }`.
-    * `401 Unauthorized`: If caller is not authenticated.
-    * `403 Forbidden`: If caller has no active workspace.
+    * `200 OK`: Returns `{ "workspaceId": N, "state": "ACTIVE" | "FREE" | "PAST_DUE" | "CANCELED", "subscription": { ... }, "paystackPlan": { ... }, "seatLimit": N, "capacity": { ... }, "ledger": [ ... ] }`.
 
-* **`POST /api/billing/webhook`**
-  * **Access:** Unauthenticated HTTP POST from Stripe webhook infrastructure.
-  * **Processing:**
-    1. Validates `STRIPE_WEBHOOK_SECRET` is configured (returns `503` if unconfigured).
-    2. Validates `stripe-signature` header format (`t=...,v1=...`).
-    3. Enforces 300-second replay tolerance window to reject stale or replayed webhooks.
-    4. Computes expected HMAC-SHA256 signature using `crypto.timingSafeEqual` to prevent timing attacks.
-    5. Dispatches event to `BillingEventProcessor`:
-       * `checkout.session.completed`: Verifies paid status, updates workspace subscription tier and seat limit, records ledger entry. Cross-endpoint idempotency avoids duplicate ledger entries if already confirmed via `/api/billing/confirm`.
-       * `subscription.created` / `subscription.updated`: Establishes or alters workspace tier and seat limits.
-       * `invoice.payment_failed`: Marks subscription `past_due`.
-       * Out-of-order protection: Discards events with timestamps older than current subscription state.
-  * **Responses:**
-    * `200 OK`: Returns `{ "received": true, "status": "processed" | "ignored_duplicate" | "ignored_out_of_order" }`.
-    * `400 Bad Request`: If signature header is missing or malformed, or payload is invalid JSON.
-    * `401 Unauthorized`: If HMAC signature is invalid or forged.
-    * `400 Bad Request`: If webhook timestamp exceeds 300-second tolerance window.
-    * `503 Service Unavailable`: If `STRIPE_WEBHOOK_SECRET` is unconfigured.
+> [!NOTE]
+> **Stripe Complete Retirement & Historical Preservation Architecture (Phase 2):**
+> * **Retired Runtime Processing:** All active Stripe endpoints (`POST /api/billing/checkout`, `POST /api/billing/confirm`, `POST /api/billing/webhook`), client library (`lib/stripe.ts`), webhook signature verification (`verifyWebhookSignature`), and Stripe event-processing logic (`BillingEventProcessor.processEvent`) are permanently disabled and retired.
+> * **Write Protection:** `BillingStorageInterface` and its implementations (`InMemoryBillingStorage`, `DatabaseBillingStorage`) actively reject any attempts to create new Stripe subscriptions, record Stripe payment events, or write Stripe ledger entries.
+> * **Paystack Default:** Schema migrations and new subscriptions default strictly to `payment_provider = 'paystack'`. Paystack routes explicitly identify Paystack as their provider.
+> * **Preserved Historical Records:** All historical Stripe database records, ledger entries, billing events, and columns (`stripe_customer_id`, `stripe_subscription_id`) are preserved intact and remain fully queryable for historical reporting, reconciliation, and audit integrity.
+> * **Display Attribution:** Historical Stripe subscriptions display verified historical status, but new Stripe subscriptions are strictly prohibited from being represented as verified.
 
 ---
 
@@ -419,74 +436,52 @@ The recovery workflow is directly wired into the Rota web interface ([`app/page.
    * `500 / Network Error`: Provides sanitized, non-leaking user feedback.
 7. **Schedule Refresh & State Cleanup:** Upon successful recovery, the interface triggers `loadShifts()` to immediately display newly assigned shifts in the calendar grid and clears the recovery banner and modal.
 
-### 8.5 Payment Integration & Operator Staging Verification Workflow
+### 8.5 Paystack Payment Integration & Stripe Retirement (Phase 2)
 
-The payment integration provides an end-to-end subscription upgrade and seat entitlement lifecycle using Stripe in test mode:
+The active payment integration provides an end-to-end subscription lifecycle exclusively using Paystack with commercial NGN pricing tiers (Starter: ₦15,000, Pro: ₦45,000, Enterprise: ₦150,000):
 
 ```
-[Manager Browser] ── 1. Select Tier ──▶ [POST /api/billing/checkout] ── 2. Create Session ──▶ [Stripe API]
-       │                                                                                             │
-       │ ◀──────────────── 3. Redirect URL & Session ID ─────────────────────────────────────────────┘
+[Manager Browser] ── 1. Select Tier ──▶ [POST /api/billing/paystack/initialize] ── 2. Create Transaction ──▶ [Paystack API]
+       │                                                                                                        │
+       │ ◀──────────────── 3. Redirect URL & Transaction Reference ─────────────────────────────────────────────┘
        ▼
-[Stripe Checkout Page (Test Mode)]
+[Paystack Checkout Modal / Page (Test Mode)]
        │
-       │ 4. Complete Test Card Payment
+       │ 4. Complete Test Card Payment (NGN)
        ▼
-[Manager Browser Return: ?session_id=cs_test_...]
+[Manager Browser Return: ?reference=pstk_init_...]
        │
-       ├── 5. POST /api/billing/confirm { sessionId } ──▶ [Server Verification (Stripe API)]
-       │                                                         │ (Authoritative retrieval,
-       │                                                         │  payment_status === "paid",
-       │                                                         │  tenant isolation check)
-       │                                                         ▼
-       │ ◀──────────── 6. Subscription Active, Seats Updated ─────
+       ├── 5. POST /api/billing/paystack/verify { reference } ──▶ [Server Verification (Paystack Gateway)]
+       │                                                                │ (Authoritative gateway retrieval,
+       │                                                                │  status === "success", currency === "NGN",
+       │                                                                │  amount match, AES-256-GCM auth encryption)
+       │                                                                ▼
+       │ ◀──────────── 6. Subscription Active, Seats Updated ───────────
        │
        └── (Asynchronous Background Webhook)
-           [Stripe] ── 7. POST /api/billing/webhook (checkout.session.completed) ──▶ [BillingEventProcessor]
-                                                                                            │
-                                                                                            ▼
-                                                             (Idempotently acknowledged; no duplicate ledger)
+           [Paystack] ── 7. POST /api/billing/paystack/webhook ──▶ [Durable Storage Ingestion]
+                                                                          │ (HMAC-SHA512 verification,
+                                                                          │  durable event deduplication,
+                                                                          │  idempotent ledger recording)
 ```
 
 #### Core Security Invariants of Payment Integration:
-1. **Server-Side Authoritative Verification:** The client can never supply or dictate subscription status, plan tier, or payment amount. The confirmation route (`/api/billing/confirm`) strictly queries Stripe directly for the authoritative session status, amount, and metadata.
-2. **Tenant Isolation:** Checkout session metadata permanently binds the `workspace_id`. Cross-tenant session confirmation attempts are rejected with `403 Forbidden`.
-3. **Proration Calculation:** Mid-cycle upgrades from an existing paid plan calculate remaining days in the billing period using `calculatePlanProration()` from `lib/proration.ts` and charge only the prorated net difference.
-4. **Bidirectional Idempotency:** If the frontend confirms the session via `/api/billing/confirm`, the subsequent asynchronous webhook (`checkout.session.completed`) detects the processed session ID and returns `ignored_duplicate` (HTTP 200) without double ledger entries.
-5. **Zero-Dependency Architecture:** Runtime integration uses native `fetch` in [`lib/stripe.ts`](file:///C:/Users/umehc/final-task-chinazom-chinaemeze/rota/web/lib/stripe.ts) with `MockStripeClient` providing 100% offline deterministic test coverage without installing the bulky third-party Stripe SDK.
+1. **Server-Side Authoritative Verification:** The client can never supply or dictate subscription status, plan tier, or payment amount. The confirmation route (`/api/billing/paystack/verify`) strictly queries the Paystack gateway directly for the authoritative transaction status, currency, amount, and metadata.
+2. **Tenant Isolation:** Checkout metadata permanently binds `workspace_id`. Cross-tenant verification attempts are rejected with `403 Forbidden`.
+3. **Encrypted Reusable Authorization Tokens:** Authorization codes returned by Paystack for recurring charges are encrypted using AES-256-GCM (`lib/paystack-security.ts`) before database persistence. Plaintext tokens are never stored, logged, or returned to clients.
+4. **Bidirectional Idempotency:** If the frontend verifies the transaction via `/api/billing/paystack/verify`, the subsequent asynchronous webhook (`charge.success`) detects the recorded transaction reference and acknowledges safely without duplicate ledger records.
+5. **Complete Stripe Retirement:** All active Stripe routes (`POST /api/billing/checkout`, `POST /api/billing/confirm`, `POST /api/billing/webhook`), client library (`lib/stripe.ts`), webhook signature verification, and event processing are permanently retired and disabled. `BillingStorageInterface` strictly rejects any new Stripe subscription writes or events. Paystack is the exclusive active provider. Historical Stripe database records and columns (`stripe_customer_id`, `stripe_subscription_id`) are preserved intact and read-only.
 
 #### Operator Setup for Staging Verification:
-To verify the payment integration in a live staging environment:
-1. **Stripe Test Mode Credentials:**
-   * Log into the [Stripe Dashboard](https://dashboard.stripe.com/) and ensure "Test mode" toggle is active.
-   * Obtain the secret key `sk_test_...` from **Developers > API keys**.
-   * Set `STRIPE_SECRET_KEY=sk_test_...` in the staging environment (Vercel Project Settings > Environment Variables).
-2. **Webhook Forwarding / Registration:**
-   * For local/staging development, install the [Stripe CLI](https://stripe.com/docs/stripe-cli):
-     ```powershell
-     stripe login
-     stripe listen --forward-to localhost:3000/api/billing/webhook
-     ```
-   * For deployed staging, register a webhook endpoint in Stripe Dashboard targeting `https://<staging-domain>/api/billing/webhook` with the following subscribed events:
-     * `checkout.session.completed`
-     * `subscription.created`
-     * `subscription.updated`
-     * `invoice.payment_failed`
-   * Copy the Signing Secret (`whsec_...`) and configure `STRIPE_WEBHOOK_SECRET=whsec_...` in the staging environment.
-3. **Staging Test Card Verification:**
-   * In Rota Settings, click "Change Plan" and choose a target tier (e.g. Pro: $79/mo, 50 seats).
-   * In the Stripe Checkout modal/redirect, use official Stripe test cards:
-     * **Success:** `4242 4242 4242 4242`, any future MM/YY, any 3-digit CVC, any ZIP.
-     * **Declined / Card Error:** `4000 0000 0000 0002` (test card declined).
-     * **3D Secure / Authentication:** `4000 0000 0000 3155` (triggers test 3DS challenge).
-4. **Trigger Staging Webhook Events via Stripe CLI:**
-   ```powershell
-   # Trigger checkout session completion
-   stripe trigger checkout.session.completed
-
-   # Trigger payment failure to test past_due handling
-   stripe trigger invoice.payment_failed
-   ```
+To verify the Paystack payment integration in staging:
+1. **Paystack Test Mode Credentials:**
+   * Configure `PAYSTACK_SECRET_KEY=sk_test_...` and `PAYSTACK_PUBLIC_KEY=pk_test_...` in `.env.billing-staging.local`.
+   * Configure `PAYSTACK_AUTH_ENCRYPTION_KEY` (64 hex characters / 32 bytes) for AES-256-GCM token encryption.
+   * Configure `CRON_SECRET` for authenticating off-session renewal triggers.
+2. **Safety Verification:**
+   * Run `npm run verify:staging-env` to audit staging invariants without secret exposure.
+3. **Test Cards:**
+   * In Paystack Checkout, use official Paystack test cards (e.g. `4081 0000 0000 0000`) for deterministic test charges.
 
 ### 8.6 Durable Billing Persistence Architecture & Migration Plan
 
@@ -617,8 +612,11 @@ Rota is continuously deployed to Vercel Serverless Functions connected directly 
 ### Required Environment Variables:
 * **`DATABASE_URL`**: PostgreSQL connection URI for the Neon database instance (specifies host, database, user, pooled connection mode, and TLS parameters).
 * **`AUTH_SECRET`**: Cryptographic secret key used to sign and verify HMAC-SHA256 session cookies.
-* **`STRIPE_SECRET_KEY`**: Stripe API Secret Key (`sk_test_...`) used for server-side Checkout Session generation and authoritative payment confirmation.
-* **`STRIPE_WEBHOOK_SECRET`**: Webhook signing secret (`whsec_...`) used to verify incoming billing events from payment providers via HMAC-SHA256.
+* **`PAYSTACK_SECRET_KEY`**: Paystack API Secret Key (`sk_test_...` in staging/test mode) used for server-side transaction initialization, verification, and renewals.
+* **`PAYSTACK_PUBLIC_KEY`**: Paystack API Public Key (`pk_test_...` in staging/test mode) used for client checkout integration.
+* **`PAYSTACK_AUTH_ENCRYPTION_KEY`**: 256-bit AES encryption key (64 hex characters) used for encrypting reusable authorization codes at rest.
+* **`CRON_SECRET`**: Secret bearer token protecting the off-session subscription renewal endpoint (`POST /api/billing/paystack/renew`).
+* *(Retired)* **`STRIPE_SECRET_KEY`** / **`STRIPE_WEBHOOK_SECRET`**: Obsolete credentials; completely retired in Phase 2 with zero active runtime dependencies.
 
 *(Note: In accordance with security protocols, environment variable values are never committed to version control).*
 
@@ -628,8 +626,8 @@ Rota is continuously deployed to Vercel Serverless Functions connected directly 
 
 ### Verified Deliverables:
 * **Core Scheduling Dashboard & RBAC:** Production-deployed at [https://rota-lovat-gamma.vercel.app/](https://rota-lovat-gamma.vercel.app/).
-* **Comprehensive Test Suite:** 374 automated tests across 68 suites (100% passing).
-* **Payment Integration in Test Mode:** Implemented, wired into the dashboard UI, and thoroughly verified in `lib/stripe.ts`, `lib/billing.ts`, `app/api/billing/checkout/route.ts`, `app/api/billing/confirm/route.ts`, `app/api/billing/route.ts`, `app/api/billing/webhook/route.ts`, and `app/page.tsx`.
+* **Comprehensive Test Suite:** 495 automated tests across 91 suites (100% passing).
+* **Paystack Exclusive Payment Integration & Complete Stripe Retirement:** Paystack test-mode checkout and verification fully active with commercial NGN pricing tiers, AES-256-GCM authorization encryption, HMAC-SHA512 webhook ingestion, and calendar-month renewal engine. Stripe completely retired and removed from all active runtime code.
 * **Durable Billing Persistence Engine & Migration:** Prepared and validated offline with atomic `ON CONFLICT` clauses, workspace integer identifier validation, subscription lifecycle handling, and unexecuted migration scripts in `lib/billing-storage.ts`, `lib/billing.ts`, `scripts/migrate-billing-persistence.mjs`, and `tests/billing-persistence.test.mjs`.
 * **Android Development Wrapper:** Implemented with Capacitor (`com.rota.app`); debug APK generated (`app-debug.apk`, 4,117,518 bytes) and linked via Google Drive.
 * **Architecture Diagram:** Documented in `docs/architecture.md`.
@@ -640,6 +638,6 @@ Rota is continuously deployed to Vercel Serverless Functions connected directly 
 
 ### Current Limitations (Awaiting External Infrastructure / Authorization):
 * **Live Database Migration:** Requires operator setup of an isolated disposable Neon staging branch before running the preflight check and migration transaction.
-* **Live Billing Webhooks & Gateway:** Configured for test mode with mocked/offline testing; live card charges require production Stripe API keys and live webhook registration.
+* **Live Billing Webhooks & Gateway:** Configured for test mode with mocked/offline testing; live card charges require production Paystack API keys and live webhook registration.
 * **Live 200-VU Stress Test:** Execution against production is strictly prohibited; running against a staging environment requires a dedicated test server.
 * **Signed Production Android Release:** The current APK is a debug development build; a production release requires a signed keystore and Google Play Console setup.

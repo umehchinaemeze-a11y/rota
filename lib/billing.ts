@@ -48,10 +48,23 @@ export interface SubscriptionState {
   workspaceId: string | number;
   planId: string;
   seats: number;
-  status: "active" | "past_due" | "canceled" | "trialing";
+  status: "active" | "past_due" | "canceled" | "trialing" | "renewal_processing" | "reconciliation_required";
   currentPeriodStart: number;
   currentPeriodEnd: number;
   updatedAt: number;
+  paymentProvider?: "stripe" | "paystack" | null;
+  autoRenewEnabled?: boolean;
+  cardBrand?: string | null;
+  cardLast4?: string | null;
+  cardExpMonth?: number | null;
+  cardExpYear?: number | null;
+  cardBank?: string | null;
+  billingAnchorDay?: number | null;
+  retryCount?: number;
+  nextRetryAt?: number | null;
+  gracePeriodExpiresAt?: number | null;
+  cancelAtPeriodEnd?: boolean;
+  lastReconciliationRef?: string | null;
 }
 
 export interface BillingLedgerEntry {
@@ -180,69 +193,23 @@ export function computeWebhookSignature(
 }
 
 /**
- * Verifies the authenticity and freshness of an incoming billing webhook signature.
+ * Retired Stripe Webhook Signature Verifier.
  *
- * @param rawPayload - Raw request body as string or Buffer
- * @param signatureHeader - Raw `stripe-signature` header string
- * @param secret - Webhook signing secret
- * @param toleranceSeconds - Maximum allowed age of signature in seconds (default: 300)
- * @param currentTime - Optional unix epoch timestamp in seconds for deterministic testing
+ * Stripe webhook signature verification has been retired and permanently disabled.
+ * Paystack HMAC-SHA512 webhook signature verification (in lib/paystack.ts) is the sole
+ * active webhook verification scheme.
  */
 export function verifyWebhookSignature(
-  rawPayload: string | Buffer,
-  signatureHeader: string | null | undefined,
-  secret: string,
-  toleranceSeconds: number = 300,
-  currentTime?: number
+  _rawPayload: string | Buffer,
+  _signatureHeader: string | null | undefined,
+  _secret: string,
+  _toleranceSeconds: number = 300,
+  _currentTime?: number
 ): { valid: boolean; reason?: string; timestamp?: number } {
-  if (!secret || typeof secret !== "string" || secret.trim().length === 0) {
-    return { valid: false, reason: "Missing webhook secret" };
-  }
-
-  const parsedHeader = parseWebhookSignatureHeader(signatureHeader);
-  if (!parsedHeader) {
-    return { valid: false, reason: "Malformed or missing signature header" };
-  }
-
-  const now = currentTime ?? Math.floor(Date.now() / 1000);
-
-  // Check timestamp freshness / replay tolerance
-  if (toleranceSeconds > 0) {
-    if (parsedHeader.timestamp > now + toleranceSeconds) {
-      return { valid: false, reason: "Timestamp is too far in the future" };
-    }
-    if (now - parsedHeader.timestamp > toleranceSeconds) {
-      return { valid: false, reason: "Signature has expired (replay protection)" };
-    }
-  }
-
-  // Compute expected signature
-  const expectedSig = computeWebhookSignature(rawPayload, secret, parsedHeader.timestamp);
-  const expectedBuffer = Buffer.from(expectedSig, "hex");
-
-  // Constant-time check against all provided v1 signatures
-  let matchFound = false;
-  for (const candidate of parsedHeader.signatures) {
-    try {
-      const candidateBuffer = Buffer.from(candidate, "hex");
-      if (
-        candidateBuffer.length === expectedBuffer.length &&
-        crypto.timingSafeEqual(candidateBuffer, expectedBuffer)
-      ) {
-        matchFound = true;
-        break;
-      }
-    } catch {
-      // Invalid hex string
-      continue;
-    }
-  }
-
-  if (!matchFound) {
-    return { valid: false, reason: "Signature mismatch" };
-  }
-
-  return { valid: true, timestamp: parsedHeader.timestamp };
+  return {
+    valid: false,
+    reason: "Stripe webhook signature verification is retired and disabled.",
+  };
 }
 
 /**
@@ -264,8 +231,10 @@ export class BillingEventProcessor {
       const defaultStorage = createDefaultBillingStorage();
       if (initialSubscriptions && defaultStorage instanceof InMemoryBillingStorage) {
         for (const s of initialSubscriptions) {
-          defaultStorage.upsertSubscription({
-            teamId: normalizeTeamId(s.workspaceId) || 1,
+          const teamId = normalizeTeamId(s.workspaceId) || 1;
+          const durableSub = {
+            teamId,
+            paymentProvider: s.paymentProvider || (s.subscriptionId?.startsWith("sub_") && !s.paymentProvider ? "stripe" : "paystack"),
             stripeSubscriptionId: s.subscriptionId,
             planId: s.planId,
             seats: s.seats,
@@ -273,7 +242,11 @@ export class BillingEventProcessor {
             currentPeriodStart: s.currentPeriodStart,
             currentPeriodEnd: s.currentPeriodEnd,
             updatedAt: s.updatedAt,
-          });
+          };
+          (defaultStorage as any).subscriptionsByTeamId.set(teamId, durableSub);
+          if (durableSub.stripeSubscriptionId) {
+            (defaultStorage as any).subscriptionsByStripeId.set(durableSub.stripeSubscriptionId, teamId);
+          }
         }
       }
       this.storage = defaultStorage;
@@ -313,6 +286,65 @@ export class BillingEventProcessor {
     return null;
   }
 
+  /**
+   * Retrieves active workspace subscription, querying durable storage first with
+   * graceful fallback to the in-memory subscription map in offline/test mode.
+   *
+   * Safety invariant: If durable storage is mandated (NODE_ENV === "production",
+   * BILLING_STORAGE === "database", or storage is DatabaseBillingStorage), any storage
+   * failure is rethrown to prohibit silent fallback to in-memory/free tier.
+   */
+  async getSubscriptionByWorkspaceDurable(
+    workspaceId: string | number
+  ): Promise<SubscriptionState | null> {
+    const teamId = normalizeTeamId(workspaceId);
+    const isDurableMandated =
+      process.env.NODE_ENV === "production" ||
+      process.env.BILLING_STORAGE === "database" ||
+      this.storage instanceof DatabaseBillingStorage;
+
+    if (teamId && this.storage) {
+      try {
+        const durable = await this.storage.getSubscriptionByTeamId(teamId);
+        if (durable && durable.status !== "canceled") {
+          return {
+            subscriptionId: durable.stripeSubscriptionId || `sub_team_${teamId}`,
+            workspaceId: durable.teamId,
+            planId: durable.planId,
+            seats: durable.seats,
+            status: durable.status,
+            currentPeriodStart: durable.currentPeriodStart,
+            currentPeriodEnd: durable.currentPeriodEnd,
+            updatedAt: durable.updatedAt,
+            paymentProvider: durable.paymentProvider,
+            autoRenewEnabled: durable.autoRenewEnabled,
+            cardBrand: durable.cardBrand,
+            cardLast4: durable.cardLast4,
+            cardExpMonth: durable.cardExpMonth,
+            cardExpYear: durable.cardExpYear,
+            cardBank: durable.cardBank,
+            billingAnchorDay: durable.billingAnchorDay,
+            retryCount: durable.retryCount,
+            nextRetryAt: durable.nextRetryAt,
+            gracePeriodExpiresAt: durable.gracePeriodExpiresAt,
+            cancelAtPeriodEnd: durable.cancelAtPeriodEnd,
+            lastReconciliationRef: durable.lastReconciliationRef,
+          };
+        }
+      } catch (err) {
+        if (isDurableMandated) {
+          throw new Error("Failed to retrieve workspace subscription from persistent storage.");
+        }
+      }
+    }
+
+    if (isDurableMandated && (!this.storage || !(this.storage instanceof DatabaseBillingStorage))) {
+      throw new Error("Persistent database storage is required but unavailable.");
+    }
+
+    return this.getSubscriptionByWorkspace(workspaceId);
+  }
+
   getLedgerByWorkspace(workspaceId: string | number): BillingLedgerEntry[] {
     const wsIdStr = String(workspaceId);
     return this.ledger
@@ -321,568 +353,65 @@ export class BillingEventProcessor {
   }
 
   /**
-   * Processes a validated billing webhook event with idempotency, out-of-order protection,
-   * and consistent ledger entries.
+   * Retrieves ledger transaction history for a workspace, querying durable storage first with
+   * graceful fallback to the in-memory ledger in offline/test mode.
    */
-  async processEvent(event: BillingEvent): Promise<ProcessEventResult> {
-    if (!event || !event.id || !event.type) {
-      return {
-        status: "failed",
-        eventId: event?.id || "unknown",
-        eventType: event?.type || "unknown",
-        message: "Invalid event structure",
-      };
-    }
+  async getLedgerByWorkspaceDurable(
+    workspaceId: string | number
+  ): Promise<BillingLedgerEntry[]> {
+    const teamId = normalizeTeamId(workspaceId);
+    const isDurableMandated =
+      process.env.NODE_ENV === "production" ||
+      process.env.BILLING_STORAGE === "database" ||
+      this.storage instanceof DatabaseBillingStorage;
 
-    // 1. Idempotency check: duplicate event protection (in-memory + durable storage)
-    if (this.processedEvents.has(event.id) || (await this.storage.isEventProcessed(event.id))) {
-      this.processedEvents.add(event.id);
-      return {
-        status: "ignored_duplicate",
-        eventId: event.id,
-        eventType: event.type,
-        message: `Event ${event.id} already processed. Acknowledged without side-effects.`,
-      };
-    }
-
-    const eventTime = event.created || Math.floor(Date.now() / 1000);
-    const obj = event.data?.object || {};
-
-    try {
-      switch (event.type) {
-        case "checkout.session.completed": {
-          const session = obj;
-          const sessionId = session.id || event.id;
-
-          // Check if session was already processed (e.g. via direct confirm endpoint)
-          if (sessionId && this.processedEvents.has(sessionId)) {
-            this.processedEvents.add(event.id);
-            return {
-              status: "ignored_duplicate",
-              eventId: event.id,
-              eventType: event.type,
-              message: `Checkout session ${sessionId} already processed. Acknowledged without side-effects.`,
-            };
-          }
-
-          const workspaceId = session.metadata?.workspace_id || session.metadata?.team_id;
-          if (!workspaceId) {
-            return {
-              status: "failed",
-              eventId: event.id,
-              eventType: event.type,
-              message: `Checkout session ${sessionId} is missing workspace_id in metadata. Cannot associate with a tenant.`,
-            };
-          }
-
-          const planId = session.metadata?.plan_id || session.metadata?.tier || "starter";
-          const seats = parseInt(session.metadata?.seats, 10) || 15;
-          const amount = session.amount_total ?? session.amount_paid ?? 0;
-          const currency = session.currency || "usd";
-          const subscriptionId = session.subscription || `sub_${sessionId}`;
-          const paymentStatus = session.payment_status || "unpaid";
-
-          // Strict Security Invariant: Must be paid. Never grant paid entitlements from unpaid sessions.
-          if (paymentStatus !== "paid") {
-            return {
-              status: "failed",
-              eventId: event.id,
-              eventType: event.type,
-              message: `Checkout session ${sessionId} payment is not complete (payment_status: ${paymentStatus}).`,
-            };
-          }
-
-          const existing = this.subscriptions.get(subscriptionId);
-          if (existing && existing.updatedAt > eventTime) {
-            this.processedEvents.add(event.id);
-            if (sessionId) this.processedEvents.add(sessionId);
-            return {
-              status: "ignored_out_of_order",
-              eventId: event.id,
-              eventType: event.type,
-              message: "Checkout session event is older than current subscription state. Discarded to prevent state regression.",
-            };
-          }
-
-          const teamId = normalizeTeamId(workspaceId) || 1;
-          await this.storage.recordLedgerEntry({
-            transactionId: `ch_${sessionId}`,
-            teamId,
-            eventId: event.id,
-            type: "checkout_session_completed",
-            amountCents: amount,
-            currency,
-            status: "succeeded",
-            createdAt: eventTime,
-          });
-
-          await this.storage.upsertSubscription({
-            teamId,
-            stripeSubscriptionId: subscriptionId,
-            planId,
-            seats,
-            status: "active",
-            currentPeriodStart: session.current_period_start || eventTime,
-            currentPeriodEnd: session.current_period_end || eventTime + 30 * 86400,
-            updatedAt: eventTime,
-          });
-
-          const eventRes = await this.storage.recordEvent({
-            eventId: event.id,
-            eventType: event.type,
-            teamId,
-            status: "processed",
-            payload: session,
-            processedAt: eventTime,
-          });
-
-          if (eventRes.isDuplicate) {
-            this.processedEvents.add(event.id);
-            if (sessionId) this.processedEvents.add(sessionId);
-            return {
-              status: "ignored_duplicate",
-              eventId: event.id,
-              eventType: event.type,
-              message: `Event ${event.id} already processed. Acknowledged without side-effects.`,
-            };
-          }
-
-          // Commit in-memory state only after durable storage operations succeed
-          this.ledger.push({
-            id: `ch_${sessionId}`,
-            workspaceId,
-            eventId: event.id,
-            type: "checkout_session_completed",
-            amount,
-            currency,
-            status: "succeeded",
-            timestamp: eventTime,
-          });
-
-          const newState: SubscriptionState = {
-            subscriptionId,
-            workspaceId,
-            planId,
-            seats,
-            status: "active",
-            currentPeriodStart: session.current_period_start || eventTime,
-            currentPeriodEnd: session.current_period_end || eventTime + 30 * 86400,
-            updatedAt: eventTime,
-          };
-          this.subscriptions.set(subscriptionId, newState);
-          this.processedEvents.add(event.id);
-          if (sessionId) this.processedEvents.add(sessionId);
-
-          return {
-            status: "processed",
-            eventId: event.id,
-            eventType: event.type,
-            message: `Checkout session ${sessionId} completed. Subscription ${subscriptionId} active with ${seats} seats.`,
-            actionTaken: "checkout_completed",
-          };
+    if (teamId && this.storage) {
+      try {
+        const durableEntries = await this.storage.getLedgerByTeamId(teamId);
+        if (durableEntries && durableEntries.length > 0) {
+          return durableEntries.map((e) => ({
+            id: e.transactionId,
+            workspaceId: e.teamId,
+            eventId: e.eventId || "",
+            type: e.type,
+            amount: e.amountCents,
+            currency: e.currency || "NGN",
+            status: (e.status === "succeeded"
+              ? "succeeded"
+              : e.status === "failed"
+              ? "failed"
+              : "pending") as "succeeded" | "failed" | "pending",
+            timestamp: e.createdAt || 0,
+          }));
         }
-
-        case "customer.subscription.created":
-        case "subscription.created": {
-          const subscriptionId = obj.id || `sub_${event.id}`;
-          const workspaceId = obj.metadata?.workspace_id || obj.metadata?.team_id;
-          if (!workspaceId) {
-            return {
-              status: "failed",
-              eventId: event.id,
-              eventType: event.type,
-              message: `Subscription ${subscriptionId} is missing workspace_id in metadata. Cannot associate with a tenant.`,
-            };
-          }
-
-          const planId = obj.items?.data?.[0]?.plan?.id || obj.plan?.id || "pro_plan";
-          const seats = obj.items?.data?.[0]?.quantity || obj.quantity || 10;
-
-          const teamId = normalizeTeamId(workspaceId) || 1;
-          await this.storage.upsertSubscription({
-            teamId,
-            stripeSubscriptionId: subscriptionId,
-            planId,
-            seats,
-            status: "active",
-            currentPeriodStart: obj.current_period_start || eventTime,
-            currentPeriodEnd: obj.current_period_end || eventTime + 30 * 86400,
-            updatedAt: eventTime,
-          });
-
-          const eventRes = await this.storage.recordEvent({
-            eventId: event.id,
-            eventType: event.type,
-            teamId,
-            status: "processed",
-            payload: obj,
-            processedAt: eventTime,
-          });
-
-          if (eventRes.isDuplicate) {
-            this.processedEvents.add(event.id);
-            return {
-              status: "ignored_duplicate",
-              eventId: event.id,
-              eventType: event.type,
-              message: `Event ${event.id} already processed. Acknowledged without side-effects.`,
-            };
-          }
-
-          const newState: SubscriptionState = {
-            subscriptionId,
-            workspaceId,
-            planId,
-            seats,
-            status: "active",
-            currentPeriodStart: obj.current_period_start || eventTime,
-            currentPeriodEnd: obj.current_period_end || eventTime + 30 * 86400,
-            updatedAt: eventTime,
-          };
-          this.subscriptions.set(subscriptionId, newState);
-          this.processedEvents.add(event.id);
-
-          return {
-            status: "processed",
-            eventId: event.id,
-            eventType: event.type,
-            message: `Subscription ${subscriptionId} created with ${seats} seats.`,
-            actionTaken: "subscription_created",
-          };
-        }
-
-        case "customer.subscription.updated":
-        case "subscription.updated": {
-          const subscriptionId = obj.id;
-          if (!subscriptionId) {
-            throw new Error("Missing subscription ID in event object");
-          }
-
-          const existing = this.subscriptions.get(subscriptionId);
-          if (existing && existing.updatedAt > eventTime) {
-            // Out of order: existing state is newer than incoming event
-            this.processedEvents.add(event.id);
-            return {
-              status: "ignored_out_of_order",
-              eventId: event.id,
-              eventType: event.type,
-              message: `Event timestamp (${eventTime}) is older than current subscription state (${existing.updatedAt}). Discarded to prevent state regression.`,
-            };
-          }
-
-          const updatedSeats = obj.items?.data?.[0]?.quantity ?? obj.quantity ?? existing?.seats ?? 10;
-          const updatedStatus = obj.status || existing?.status || "active";
-          const updatedPlan = obj.items?.data?.[0]?.plan?.id ?? obj.plan?.id ?? existing?.planId ?? "pro_plan";
-          const resolvedWorkspaceId = existing?.workspaceId || obj.metadata?.workspace_id || obj.metadata?.team_id;
-
-          if (!resolvedWorkspaceId) {
-            return {
-              status: "failed",
-              eventId: event.id,
-              eventType: event.type,
-              message: `Subscription ${subscriptionId} update missing workspace association.`,
-            };
-          }
-
-          const teamId = normalizeTeamId(resolvedWorkspaceId) || 1;
-          await this.storage.upsertSubscription({
-            teamId,
-            stripeSubscriptionId: subscriptionId,
-            planId: updatedPlan,
-            seats: updatedSeats,
-            status: updatedStatus,
-            currentPeriodStart: obj.current_period_start || existing?.currentPeriodStart || eventTime,
-            currentPeriodEnd: obj.current_period_end || existing?.currentPeriodEnd || eventTime + 30 * 86400,
-            updatedAt: eventTime,
-          });
-
-          const eventRes = await this.storage.recordEvent({
-            eventId: event.id,
-            eventType: event.type,
-            teamId,
-            status: "processed",
-            payload: obj,
-            processedAt: eventTime,
-          });
-
-          if (eventRes.isDuplicate) {
-            this.processedEvents.add(event.id);
-            return {
-              status: "ignored_duplicate",
-              eventId: event.id,
-              eventType: event.type,
-              message: `Event ${event.id} already processed. Acknowledged without side-effects.`,
-            };
-          }
-
-          const updatedState: SubscriptionState = {
-            subscriptionId,
-            workspaceId: resolvedWorkspaceId,
-            planId: updatedPlan,
-            seats: updatedSeats,
-            status: updatedStatus,
-            currentPeriodStart: obj.current_period_start || existing?.currentPeriodStart || eventTime,
-            currentPeriodEnd: obj.current_period_end || existing?.currentPeriodEnd || eventTime + 30 * 86400,
-            updatedAt: eventTime,
-          };
-          this.subscriptions.set(subscriptionId, updatedState);
-          this.processedEvents.add(event.id);
-
-          return {
-            status: "processed",
-            eventId: event.id,
-            eventType: event.type,
-            message: `Subscription ${subscriptionId} updated (seats: ${updatedSeats}, status: ${updatedStatus}).`,
-            actionTaken: "subscription_updated",
-          };
-        }
-
-        case "customer.subscription.deleted":
-        case "subscription.deleted": {
-          const subscriptionId = obj.id;
-          if (!subscriptionId) {
-            throw new Error("Missing subscription ID in event object");
-          }
-
-          const existing = this.subscriptions.get(subscriptionId);
-          if (existing && existing.updatedAt > eventTime) {
-            this.processedEvents.add(event.id);
-            return {
-              status: "ignored_out_of_order",
-              eventId: event.id,
-              eventType: event.type,
-              message: "Subscription deletion event is older than current state. Ignored.",
-            };
-          }
-
-          const teamId = existing ? normalizeTeamId(existing.workspaceId) : null;
-          if (teamId) {
-            await this.storage.upsertSubscription({
-              teamId,
-              stripeSubscriptionId: subscriptionId,
-              planId: "free",
-              seats: 5,
-              status: "canceled",
-              currentPeriodStart: existing?.currentPeriodStart || eventTime,
-              currentPeriodEnd: existing?.currentPeriodEnd || eventTime,
-              updatedAt: eventTime,
-            });
-          }
-
-          const eventRes = await this.storage.recordEvent({
-            eventId: event.id,
-            eventType: event.type,
-            teamId: teamId || undefined,
-            status: "processed",
-            payload: obj,
-            processedAt: eventTime,
-          });
-
-          if (eventRes.isDuplicate) {
-            this.processedEvents.add(event.id);
-            return {
-              status: "ignored_duplicate",
-              eventId: event.id,
-              eventType: event.type,
-              message: `Event ${event.id} already processed. Acknowledged without side-effects.`,
-            };
-          }
-
-          if (existing) {
-            existing.status = "canceled";
-            existing.updatedAt = eventTime;
-            this.subscriptions.set(subscriptionId, existing);
-          }
-          this.processedEvents.add(event.id);
-
-          return {
-            status: "processed",
-            eventId: event.id,
-            eventType: event.type,
-            message: `Subscription ${subscriptionId} canceled. Workspace reverted to free tier.`,
-            actionTaken: "subscription_canceled",
-          };
-        }
-
-        case "invoice.payment_succeeded": {
-          const invoiceId = obj.id || `inv_${event.id}`;
-          const amount = obj.amount_paid ?? obj.amount_due ?? 0;
-          const currency = obj.currency || "usd";
-          const subscriptionId = obj.subscription;
-          const workspaceId =
-            obj.metadata?.workspace_id ||
-            obj.metadata?.team_id ||
-            (subscriptionId ? this.subscriptions.get(subscriptionId)?.workspaceId : null);
-
-          if (!workspaceId) {
-            this.processedEvents.add(event.id);
-            return {
-              status: "processed",
-              eventId: event.id,
-              eventType: event.type,
-              message: `Invoice ${invoiceId} received without associated workspace. Acknowledged without ledger entry.`,
-              actionTaken: "unattributed_invoice",
-            };
-          }
-
-          const teamId = normalizeTeamId(workspaceId) || 1;
-          await this.storage.recordLedgerEntry({
-            transactionId: invoiceId,
-            teamId,
-            eventId: event.id,
-            type: "payment_succeeded",
-            amountCents: amount,
-            currency,
-            status: "succeeded",
-            createdAt: eventTime,
-          });
-
-          const eventRes = await this.storage.recordEvent({
-            eventId: event.id,
-            eventType: event.type,
-            teamId,
-            status: "processed",
-            payload: obj,
-            processedAt: eventTime,
-          });
-
-          if (eventRes.isDuplicate) {
-            this.processedEvents.add(event.id);
-            return {
-              status: "ignored_duplicate",
-              eventId: event.id,
-              eventType: event.type,
-              message: `Event ${event.id} already processed. Acknowledged without side-effects.`,
-            };
-          }
-
-          this.ledger.push({
-            id: invoiceId,
-            workspaceId,
-            eventId: event.id,
-            type: "payment_succeeded",
-            amount,
-            currency,
-            status: "succeeded",
-            timestamp: eventTime,
-          });
-          this.processedEvents.add(event.id);
-
-          return {
-            status: "processed",
-            eventId: event.id,
-            eventType: event.type,
-            message: `Invoice ${invoiceId} payment succeeded (${amount} ${currency.toUpperCase()}). Ledger recorded.`,
-            actionTaken: "invoice_recorded",
-          };
-        }
-
-        case "invoice.payment_failed": {
-          const invoiceId = obj.id || `inv_${event.id}`;
-          const subscriptionId = obj.subscription;
-          const workspaceId =
-            obj.metadata?.workspace_id ||
-            obj.metadata?.team_id ||
-            (subscriptionId ? this.subscriptions.get(subscriptionId)?.workspaceId : null);
-
-          const teamId = normalizeTeamId(workspaceId) || 1;
-          if (workspaceId) {
-            await this.storage.recordLedgerEntry({
-              transactionId: invoiceId,
-              teamId,
-              eventId: event.id,
-              type: "payment_failed",
-              amountCents: obj.amount_due ?? 0,
-              currency: obj.currency || "usd",
-              status: "failed",
-              createdAt: eventTime,
-            });
-          }
-
-          if (subscriptionId && this.subscriptions.has(subscriptionId)) {
-            const sub = this.subscriptions.get(subscriptionId)!;
-            await this.storage.upsertSubscription({
-              teamId,
-              stripeSubscriptionId: subscriptionId,
-              planId: sub.planId,
-              seats: sub.seats,
-              status: "past_due",
-              currentPeriodStart: sub.currentPeriodStart,
-              currentPeriodEnd: sub.currentPeriodEnd,
-              updatedAt: eventTime,
-            });
-          }
-
-          const eventRes = await this.storage.recordEvent({
-            eventId: event.id,
-            eventType: event.type,
-            teamId,
-            status: "processed",
-            payload: obj,
-            processedAt: eventTime,
-          });
-
-          if (eventRes.isDuplicate) {
-            this.processedEvents.add(event.id);
-            return {
-              status: "ignored_duplicate",
-              eventId: event.id,
-              eventType: event.type,
-              message: `Event ${event.id} already processed. Acknowledged without side-effects.`,
-            };
-          }
-
-          if (subscriptionId && this.subscriptions.has(subscriptionId)) {
-            const sub = this.subscriptions.get(subscriptionId)!;
-            sub.status = "past_due";
-            sub.updatedAt = eventTime;
-            this.subscriptions.set(subscriptionId, sub);
-          }
-
-          if (workspaceId) {
-            this.ledger.push({
-              id: invoiceId,
-              workspaceId,
-              eventId: event.id,
-              type: "payment_failed",
-              amount: obj.amount_due ?? 0,
-              currency: obj.currency || "usd",
-              status: "failed",
-              timestamp: eventTime,
-            });
-          }
-
-          this.processedEvents.add(event.id);
-
-          return {
-            status: "processed",
-            eventId: event.id,
-            eventType: event.type,
-            message: `Invoice payment failed. Subscription marked past_due.`,
-            actionTaken: "subscription_past_due",
-          };
-        }
-
-        default: {
-          // Unhandled event type: record receipt, acknowledge HTTP 200 without side effects
-          this.processedEvents.add(event.id);
-          return {
-            status: "processed",
-            eventId: event.id,
-            eventType: event.type,
-            message: `Event type ${event.type} received and ignored safely.`,
-            actionTaken: "none",
-          };
+      } catch (err) {
+        if (isDurableMandated) {
+          throw new Error("Failed to retrieve workspace billing ledger from persistent storage.");
         }
       }
-    } catch (err: any) {
-      return {
-        status: "failed",
-        eventId: event.id,
-        eventType: event.type,
-        message: `Processing failed: ${err?.message || "Unknown error"}`,
-      };
     }
+
+    return this.getLedgerByWorkspace(workspaceId);
+  }
+
+  /**
+   * Retired Stripe Webhook Event Processor.
+   *
+   * Stripe event processing has been retired and permanently disabled.
+   * New Stripe payment events and lifecycle mutations are strictly rejected without side-effects.
+   * Paystack webhook handling via /api/billing/paystack/webhook is the sole active event-processing path.
+   */
+  async processEvent(event: BillingEvent): Promise<ProcessEventResult> {
+    const eventId = event?.id || "unknown";
+    const eventType = event?.type || "unknown";
+
+    return {
+      status: "failed",
+      eventId,
+      eventType,
+      message: "Stripe event processing is retired and disabled. New Stripe events cannot mutate subscriptions or records.",
+      actionTaken: "none",
+    };
   }
 }
 

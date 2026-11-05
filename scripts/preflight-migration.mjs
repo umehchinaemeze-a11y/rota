@@ -396,17 +396,26 @@ export async function executePreflightInspection(client, options = {}) {
     if (tables.shifts.exists) {
       const demoUserIds = foundDemoUsers.map((u) => u.id);
 
-      // Perform read-only shift count breakdown
-      const shiftCountRes = await safeQuery(
-        `SELECT
+      const hasTeamId = !!tables.shifts.columns?.team_id;
+
+      // Perform read-only shift count breakdown safely whether team_id has been added or not
+      const shiftSql = hasTeamId
+        ? `SELECT
            COUNT(*)::INTEGER AS total_shifts,
            COUNT(*) FILTER (WHERE user_id = ANY($1) AND (team_id IS NULL OR team_id = 0))::INTEGER AS eligible_for_backfill,
            COUNT(*) FILTER (WHERE user_id IS NULL)::INTEGER AS unassigned_shifts,
            COUNT(*) FILTER (WHERE user_id IS NOT NULL AND NOT (user_id = ANY($1)))::INTEGER AS non_demo_shifts,
            COUNT(*) FILTER (WHERE team_id IS NOT NULL AND team_id > 0)::INTEGER AS already_assigned_shifts
-         FROM shifts;`,
-        [demoUserIds]
-      );
+         FROM shifts;`
+        : `SELECT
+           COUNT(*)::INTEGER AS total_shifts,
+           COUNT(*) FILTER (WHERE user_id = ANY($1))::INTEGER AS eligible_for_backfill,
+           COUNT(*) FILTER (WHERE user_id IS NULL)::INTEGER AS unassigned_shifts,
+           COUNT(*) FILTER (WHERE user_id IS NOT NULL AND NOT (user_id = ANY($1)))::INTEGER AS non_demo_shifts,
+           0::INTEGER AS already_assigned_shifts
+         FROM shifts;`;
+
+      const shiftCountRes = await safeQuery(shiftSql, [demoUserIds]);
 
       const counts = shiftCountRes?.rows?.[0] || {};
       shiftCounts.totalShifts = Number(counts.total_shifts) || 0;

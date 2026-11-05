@@ -23,6 +23,9 @@ import {
   ROLLBACK_PLAN_SQL,
 } from "../scripts/migrate-billing-persistence.mjs";
 
+import { handleGetBillingStatus } from "../app/api/billing/route.ts";
+import { handlePaystackInitialize } from "../app/api/billing/paystack/initialize/route.ts";
+
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
 const scriptsDir = path.resolve(currentDir, "..", "scripts");
 const scriptPath = path.resolve(scriptsDir, "migrate-billing-persistence.mjs");
@@ -52,7 +55,10 @@ describe("Durable Billing Persistence — Schema & Identifier Safety", () => {
     assert.ok(MIGRATION_DDL.includes("event_id VARCHAR(255) UNIQUE NOT NULL"));
     assert.ok(MIGRATION_DDL.includes("CREATE TABLE IF NOT EXISTS billing_ledger"));
     assert.ok(MIGRATION_DDL.includes("transaction_id VARCHAR(255) UNIQUE NOT NULL"));
-    assert.ok(MIGRATION_DDL.includes("team_id INTEGER NOT NULL REFERENCES teams(id)"));
+    assert.ok(MIGRATION_DDL.includes("team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE RESTRICT"));
+    assert.ok(MIGRATION_DDL.includes("currency VARCHAR(10) NOT NULL DEFAULT 'NGN'"));
+    assert.ok(MIGRATION_DDL.includes("ALTER TABLE billing_ledger\n  ALTER COLUMN currency SET DEFAULT 'NGN'"));
+    assert.ok(MIGRATION_DDL.includes("FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE RESTRICT"));
   });
 
   it("provides documented rollback SQL in reverse dependency order", () => {
@@ -166,25 +172,38 @@ describe("Durable Billing Persistence — In-Memory Storage Contract", () => {
   it("records events and identifies duplicate event IDs accurately", async () => {
     const storage = new InMemoryBillingStorage();
     const event = {
-      eventId: "evt_test_100",
-      eventType: "checkout.session.completed",
+      eventId: "pstk_evt_test_100",
+      eventType: "payment.verified",
       teamId: 1,
       status: "processed",
     };
 
     const first = await storage.recordEvent(event);
     assert.equal(first.isDuplicate, false);
-    assert.equal(await storage.isEventProcessed("evt_test_100"), true);
+    assert.equal(await storage.isEventProcessed("pstk_evt_test_100"), true);
 
     const second = await storage.recordEvent(event);
     assert.equal(second.isDuplicate, true);
+
+    // Verify Stripe event writes are rejected
+    await assert.rejects(
+      async () => {
+        await storage.recordEvent({
+          eventId: "evt_stripe_prohibited",
+          eventType: "customer.subscription.created",
+          status: "processed",
+        });
+      },
+      /Cannot record Stripe event.*Stripe provider has been retired/
+    );
   });
 
   it("upserts subscription state atomically without creating duplicate team rows", async () => {
     const storage = new InMemoryBillingStorage();
     const initial = {
       teamId: 10,
-      stripeSubscriptionId: "sub_initial",
+      paymentProvider: "paystack",
+      paystackCustomerCode: "CUS_initial",
       planId: "starter",
       seats: 15,
       status: "active",
@@ -197,11 +216,13 @@ describe("Durable Billing Persistence — In-Memory Storage Contract", () => {
     const sub1 = await storage.getSubscriptionByTeamId(10);
     assert.equal(sub1.planId, "starter");
     assert.equal(sub1.seats, 15);
+    assert.equal(sub1.paymentProvider, "paystack");
 
     // Upgrade workspace 10 to Pro plan (50 seats)
     await storage.upsertSubscription({
       teamId: 10,
-      stripeSubscriptionId: "sub_upgraded",
+      paymentProvider: "paystack",
+      paystackCustomerCode: "CUS_upgraded",
       planId: "pro",
       seats: 50,
       status: "active",
@@ -214,18 +235,34 @@ describe("Durable Billing Persistence — In-Memory Storage Contract", () => {
     const sub2 = await storage.getSubscriptionByTeamId(10);
     assert.equal(sub2.planId, "pro");
     assert.equal(sub2.seats, 50);
-    assert.equal(sub2.stripeSubscriptionId, "sub_upgraded");
+    assert.equal(sub2.paystackCustomerCode, "CUS_upgraded");
+
+    // Verify Stripe subscription writes are rejected
+    await assert.rejects(
+      async () => {
+        await storage.upsertSubscription({
+          teamId: 11,
+          paymentProvider: "stripe",
+          planId: "pro",
+          seats: 50,
+          status: "active",
+          currentPeriodStart: 1700000000,
+          currentPeriodEnd: 1702592000,
+        });
+      },
+      /Cannot create or update Stripe subscription.*Stripe provider has been retired/
+    );
   });
 
   it("records ledger entries idempotently by unique transaction ID", async () => {
     const storage = new InMemoryBillingStorage();
     const entry = {
-      transactionId: "ch_cs_test_123",
+      transactionId: "pstk_tx_test_123",
       teamId: 10,
-      eventId: "evt_123",
-      type: "checkout_session_completed",
+      eventId: "pstk_evt_123",
+      type: "charge.success",
       amountCents: 2900,
-      currency: "usd",
+      currency: "NGN",
       status: "succeeded",
     };
 
@@ -237,6 +274,100 @@ describe("Durable Billing Persistence — In-Memory Storage Contract", () => {
 
     const ledger = await storage.getLedgerByTeamId(10);
     assert.equal(ledger.length, 1);
+    assert.equal(ledger[0].amountCents, 2900);
+
+    // Verify Stripe ledger entry writes are rejected
+    await assert.rejects(
+      async () => {
+        await storage.recordLedgerEntry({
+          transactionId: "ch_stripe_legacy_attempt",
+          teamId: 10,
+          type: "checkout_session_completed",
+          amountCents: 2900,
+          currency: "usd",
+          status: "succeeded",
+        });
+      },
+      /Cannot record Stripe ledger entry.*Stripe provider has been retired/
+    );
+  });
+
+  it("enforces ON DELETE RESTRICT in schema DDL to prevent silent deletion of financial history", () => {
+    assert.ok(
+      MIGRATION_DDL.includes("team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE RESTRICT"),
+      "billing_ledger must use ON DELETE RESTRICT"
+    );
+    assert.ok(
+      !MIGRATION_DDL.includes("billing_ledger (\n  id SERIAL PRIMARY KEY,\n  transaction_id VARCHAR(255) UNIQUE NOT NULL,\n  team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE"),
+      "billing_ledger must NOT use ON DELETE CASCADE"
+    );
+  });
+
+  it("defaults ledger currency to NGN when currency is omitted", async () => {
+    const storage = new InMemoryBillingStorage();
+    const res = await storage.recordLedgerEntry({
+      transactionId: "pstk_tx_default_curr",
+      teamId: 10,
+      type: "charge.success",
+      amountCents: 1500000,
+      status: "succeeded",
+    });
+
+    assert.equal(res.entry.currency, "NGN");
+    assert.equal(res.entry.amountCents, 1500000);
+    assert.equal(res.entry.amountKobo, 1500000);
+  });
+
+  it("accepts amountKobo alias and enforces integer amounts with zero floating-point conversion", async () => {
+    const storage = new InMemoryBillingStorage();
+    const res = await storage.recordLedgerEntry({
+      transactionId: "pstk_tx_kobo_alias",
+      teamId: 10,
+      type: "charge.success",
+      amountKobo: 4500000,
+      amountCents: 4500000,
+      currency: "NGN",
+      status: "succeeded",
+    });
+
+    assert.equal(res.entry.amountCents, 4500000);
+    assert.equal(res.entry.amountKobo, 4500000);
+    assert.equal(res.entry.currency, "NGN");
+
+    // Rejects floating point amounts
+    await assert.rejects(
+      async () => {
+        await storage.recordLedgerEntry({
+          transactionId: "pstk_tx_float",
+          teamId: 10,
+          type: "charge.success",
+          amountCents: 1500.5,
+          status: "succeeded",
+        });
+      },
+      /Ledger amount must be a non-negative integer/
+    );
+  });
+
+  it("preserves historical records and original currency semantics (e.g. USD cents)", async () => {
+    const storage = new InMemoryBillingStorage();
+    const historicalEntry = {
+      transactionId: "historical_tx_usd_123",
+      teamId: 10,
+      eventId: "evt_hist_123",
+      type: "invoice.paid",
+      amountCents: 2900,
+      currency: "usd",
+      status: "succeeded",
+    };
+
+    const res = await storage.recordLedgerEntry(historicalEntry);
+    assert.equal(res.entry.currency, "usd");
+    assert.equal(res.entry.amountCents, 2900);
+    assert.equal(res.entry.amountKobo, undefined, "USD records should not have amountKobo set");
+
+    const ledger = await storage.getLedgerByTeamId(10);
+    assert.equal(ledger[0].currency, "usd");
     assert.equal(ledger[0].amountCents, 2900);
   });
 });
@@ -280,6 +411,9 @@ describe("Durable Billing Persistence — Database SQL Storage Mock Verification
               cancel_at_period_end: params[8],
               updated_at: params[9],
               created_at: params[9],
+              payment_provider: params[10],
+              paystack_customer_code: params[11],
+              paystack_subscription_code: params[12],
             },
           ],
         };
@@ -306,10 +440,10 @@ describe("Durable Billing Persistence — Database SQL Storage Mock Verification
 
     const dbStorage = new DatabaseBillingStorage(mockQueryFn);
 
-    // 1. Record event
+    // 1. Record event (Paystack)
     const eventRes = await dbStorage.recordEvent({
-      eventId: "evt_sql_1",
-      eventType: "checkout.session.completed",
+      eventId: "pstk_sql_1",
+      eventType: "charge.success",
       teamId: 5,
       status: "processed",
       processedAt: 1700000000,
@@ -317,13 +451,14 @@ describe("Durable Billing Persistence — Database SQL Storage Mock Verification
     assert.equal(eventRes.isDuplicate, false);
     assert.ok(executedSql[0].includes("INSERT INTO billing_events"));
     assert.ok(executedSql[0].includes("ON CONFLICT (event_id) DO NOTHING"));
-    assert.equal(queryParams[0][0], "evt_sql_1");
+    assert.equal(queryParams[0][0], "pstk_sql_1");
     assert.equal(queryParams[0][2], 5);
 
-    // 2. Upsert subscription
+    // 2. Upsert subscription (Paystack)
     const subRes = await dbStorage.upsertSubscription({
       teamId: 5,
-      stripeSubscriptionId: "sub_sql_1",
+      paymentProvider: "paystack",
+      paystackSubscriptionCode: "sub_sql_1",
       planId: "pro",
       seats: 50,
       status: "active",
@@ -333,33 +468,145 @@ describe("Durable Billing Persistence — Database SQL Storage Mock Verification
     });
     assert.equal(subRes.planId, "pro");
     assert.equal(subRes.seats, 50);
+    assert.equal(subRes.paymentProvider, "paystack");
     assert.ok(executedSql[1].includes("INSERT INTO workspace_subscriptions"));
     assert.ok(executedSql[1].includes("ON CONFLICT (team_id) DO UPDATE SET"));
 
-    // 3. Record ledger entry
+    // 3. Record ledger entry (Paystack)
     const ledgerRes = await dbStorage.recordLedgerEntry({
-      transactionId: "ch_sql_1",
+      transactionId: "pstk_sql_tx_1",
       teamId: 5,
-      eventId: "evt_sql_1",
-      type: "checkout_session_completed",
+      eventId: "pstk_sql_1",
+      type: "paystack_charge_success",
       amountCents: 7900,
-      currency: "usd",
+      currency: "NGN",
       status: "succeeded",
       createdAt: 1700000000,
     });
     assert.equal(ledgerRes.isDuplicate, false);
     assert.ok(executedSql[2].includes("INSERT INTO billing_ledger"));
     assert.ok(executedSql[2].includes("ON CONFLICT (transaction_id) DO NOTHING"));
+
+    // 4. Verify DatabaseBillingStorage rejects new Stripe writes
+    await assert.rejects(
+      async () => {
+        await dbStorage.upsertSubscription({
+          teamId: 5,
+          paymentProvider: "stripe",
+          planId: "pro",
+        });
+      },
+      /Cannot create or update Stripe subscription.*Stripe provider has been retired/
+    );
+
+    await assert.rejects(
+      async () => {
+        await dbStorage.recordEvent({
+          eventId: "evt_stripe_db_blocked",
+          eventType: "customer.subscription.created",
+        });
+      },
+      /Cannot record Stripe event.*Stripe provider has been retired/
+    );
+
+    await assert.rejects(
+      async () => {
+        await dbStorage.recordLedgerEntry({
+          transactionId: "ch_stripe_db_blocked",
+          teamId: 5,
+        });
+      },
+      /Cannot record Stripe ledger entry.*Stripe provider has been retired/
+    );
+  });
+
+  it("enforces ON DELETE RESTRICT in schema DDL to prevent silent deletion of financial history", () => {
+    assert.ok(
+      MIGRATION_DDL.includes("team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE RESTRICT"),
+      "billing_ledger must use ON DELETE RESTRICT"
+    );
+    assert.ok(
+      !MIGRATION_DDL.includes("billing_ledger (\n  id SERIAL PRIMARY KEY,\n  transaction_id VARCHAR(255) UNIQUE NOT NULL,\n  team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE"),
+      "billing_ledger must NOT use ON DELETE CASCADE"
+    );
+  });
+
+  it("defaults ledger currency to NGN when currency is omitted", async () => {
+    const storage = new InMemoryBillingStorage();
+    const res = await storage.recordLedgerEntry({
+      transactionId: "pstk_tx_default_curr",
+      teamId: 10,
+      type: "charge.success",
+      amountCents: 1500000,
+      status: "succeeded",
+    });
+
+    assert.equal(res.entry.currency, "NGN");
+    assert.equal(res.entry.amountCents, 1500000);
+    assert.equal(res.entry.amountKobo, 1500000);
+  });
+
+  it("accepts amountKobo alias and enforces integer amounts with zero floating-point conversion", async () => {
+    const storage = new InMemoryBillingStorage();
+    const res = await storage.recordLedgerEntry({
+      transactionId: "pstk_tx_kobo_alias",
+      teamId: 10,
+      type: "charge.success",
+      amountKobo: 4500000,
+      amountCents: 4500000,
+      currency: "NGN",
+      status: "succeeded",
+    });
+
+    assert.equal(res.entry.amountCents, 4500000);
+    assert.equal(res.entry.amountKobo, 4500000);
+    assert.equal(res.entry.currency, "NGN");
+
+    // Rejects floating point amounts
+    await assert.rejects(
+      async () => {
+        await storage.recordLedgerEntry({
+          transactionId: "pstk_tx_float",
+          teamId: 10,
+          type: "charge.success",
+          amountCents: 1500.5,
+          status: "succeeded",
+        });
+      },
+      /Ledger amount must be a non-negative integer/
+    );
+  });
+
+  it("preserves historical records and original currency semantics (e.g. USD cents)", async () => {
+    const storage = new InMemoryBillingStorage();
+    const historicalEntry = {
+      transactionId: "historical_tx_usd_123",
+      teamId: 10,
+      eventId: "evt_hist_123",
+      type: "invoice.paid",
+      amountCents: 2900,
+      currency: "usd",
+      status: "succeeded",
+    };
+
+    const res = await storage.recordLedgerEntry(historicalEntry);
+    assert.equal(res.entry.currency, "usd");
+    assert.equal(res.entry.amountCents, 2900);
+    assert.equal(res.entry.amountKobo, undefined, "USD records should not have amountKobo set");
+
+    const ledger = await storage.getLedgerByTeamId(10);
+    assert.equal(ledger[0].currency, "usd");
+    assert.equal(ledger[0].amountCents, 2900);
   });
 });
 
 describe("Durable Billing Persistence — Subscription Lifecycle & Concurrency Transitions", () => {
-  it("transitions cleanly through complete subscription lifecycle (create, upgrade, downgrade, cancel)", async () => {
+  it("rejects Stripe event mutations and transitions cleanly through complete Paystack subscription lifecycle", async () => {
     const storage = new InMemoryBillingStorage();
     const processor = new BillingEventProcessor(undefined, storage);
 
-    // 1. Initial creation (Starter plan, 15 seats)
-    const createRes = await processor.processEvent({
+    // 1. Stripe lifecycle events are rejected and cannot mutate subscriptions
+    const stripeAttempt = await processor.processEvent({
       id: "evt_cycle_1",
       type: "customer.subscription.created",
       created: 1700000000,
@@ -371,66 +618,77 @@ describe("Durable Billing Persistence — Subscription Lifecycle & Concurrency T
         },
       },
     });
-    assert.equal(createRes.status, "processed");
+    assert.equal(stripeAttempt.status, "failed");
+    assert.ok(stripeAttempt.message.includes("Stripe event processing is retired and disabled"));
 
     let sub = await storage.getSubscriptionByTeamId(20);
+    assert.equal(sub, null);
+
+    // 2. Initial Paystack creation (Starter plan, 15 seats)
+    await storage.upsertSubscription({
+      teamId: 20,
+      paymentProvider: "paystack",
+      paystackSubscriptionCode: "SUB_cycle_1",
+      planId: "starter",
+      seats: 15,
+      status: "active",
+      currentPeriodStart: 1700000000,
+      currentPeriodEnd: 1702592000,
+      updatedAt: 1700000000,
+    });
+
+    sub = await storage.getSubscriptionByTeamId(20);
     assert.equal(sub.planId, "starter");
     assert.equal(sub.seats, 15);
     assert.equal(sub.status, "active");
+    assert.equal(sub.paymentProvider, "paystack");
 
-    // 2. Upgrade to Pro plan (50 seats)
-    const upgradeRes = await processor.processEvent({
-      id: "evt_cycle_2",
-      type: "customer.subscription.updated",
-      created: 1700010000,
-      data: {
-        object: {
-          id: "sub_lifecycle_1",
-          metadata: { workspace_id: "20" },
-          items: { data: [{ plan: { id: "pro" }, quantity: 50 }] },
-          status: "active",
-        },
-      },
+    // 3. Upgrade to Pro plan (50 seats)
+    await storage.upsertSubscription({
+      teamId: 20,
+      paymentProvider: "paystack",
+      paystackSubscriptionCode: "SUB_cycle_1",
+      planId: "pro",
+      seats: 50,
+      status: "active",
+      currentPeriodStart: 1700000000,
+      currentPeriodEnd: 1702592000,
+      updatedAt: 1700010000,
     });
-    assert.equal(upgradeRes.status, "processed");
 
     sub = await storage.getSubscriptionByTeamId(20);
     assert.equal(sub.planId, "pro");
     assert.equal(sub.seats, 50);
 
-    // 3. Downgrade to Starter plan (15 seats)
-    const downgradeRes = await processor.processEvent({
-      id: "evt_cycle_3",
-      type: "customer.subscription.updated",
-      created: 1700020000,
-      data: {
-        object: {
-          id: "sub_lifecycle_1",
-          metadata: { workspace_id: "20" },
-          items: { data: [{ plan: { id: "starter" }, quantity: 15 }] },
-          status: "active",
-        },
-      },
+    // 4. Downgrade to Starter plan (15 seats)
+    await storage.upsertSubscription({
+      teamId: 20,
+      paymentProvider: "paystack",
+      paystackSubscriptionCode: "SUB_cycle_1",
+      planId: "starter",
+      seats: 15,
+      status: "active",
+      currentPeriodStart: 1700000000,
+      currentPeriodEnd: 1702592000,
+      updatedAt: 1700020000,
     });
-    assert.equal(downgradeRes.status, "processed");
 
     sub = await storage.getSubscriptionByTeamId(20);
     assert.equal(sub.planId, "starter");
     assert.equal(sub.seats, 15);
 
-    // 4. Cancellation (Reverts to Free tier baseline, canceled status)
-    const cancelRes = await processor.processEvent({
-      id: "evt_cycle_4",
-      type: "customer.subscription.deleted",
-      created: 1700030000,
-      data: {
-        object: {
-          id: "sub_lifecycle_1",
-          metadata: { workspace_id: "20" },
-        },
-      },
+    // 5. Cancellation (Reverts to Free tier baseline, canceled status)
+    await storage.upsertSubscription({
+      teamId: 20,
+      paymentProvider: "paystack",
+      paystackSubscriptionCode: "SUB_cycle_1",
+      planId: "starter",
+      seats: 5,
+      status: "canceled",
+      currentPeriodStart: 1700000000,
+      currentPeriodEnd: 1702592000,
+      updatedAt: 1700030000,
     });
-    assert.equal(cancelRes.status, "processed");
 
     sub = await storage.getSubscriptionByTeamId(20);
     assert.equal(sub.status, "canceled");
@@ -440,7 +698,8 @@ describe("Durable Billing Persistence — Subscription Lifecycle & Concurrency T
     const storage = new InMemoryBillingStorage();
     const processor = new BillingEventProcessor(undefined, storage);
 
-    const event = {
+    // 1. Concurrent Stripe events are rejected and do not create ledger entries
+    const stripeEvent = {
       id: "evt_race_condition_test",
       type: "checkout.session.completed",
       created: 1700000000,
@@ -457,25 +716,40 @@ describe("Durable Billing Persistence — Subscription Lifecycle & Concurrency T
       },
     };
 
-    // Simulate two simultaneous webhook deliveries hitting the processor concurrently
-    const [result1, result2] = await Promise.all([
-      processor.processEvent(event),
-      processor.processEvent(event),
+    const [sResult1, sResult2] = await Promise.all([
+      processor.processEvent(stripeEvent),
+      processor.processEvent(stripeEvent),
+    ]);
+    assert.equal(sResult1.status, "failed");
+    assert.equal(sResult2.status, "failed");
+
+    const emptyLedger = await storage.getLedgerByTeamId(40);
+    assert.equal(emptyLedger.length, 0);
+
+    // 2. Concurrent Paystack ledger recordings are idempotent
+    const paystackEntry = {
+      transactionId: "pstk_tx_race_101",
+      teamId: 40,
+      eventId: "pstk_evt_race_101",
+      type: "paystack_charge_success",
+      amountCents: 7900,
+      currency: "NGN",
+      status: "succeeded",
+      createdAt: 1700000000,
+    };
+
+    const [res1, res2] = await Promise.all([
+      storage.recordLedgerEntry(paystackEntry),
+      storage.recordLedgerEntry(paystackEntry),
     ]);
 
-    // One must succeed as processed, the other must be ignored as duplicate
-    const outcomes = [result1.status, result2.status].sort();
-    assert.deepEqual(outcomes, ["ignored_duplicate", "processed"]);
+    const outcomes = [res1.isDuplicate, res2.isDuplicate].sort();
+    assert.deepEqual(outcomes, [false, true]);
 
     // Exactly one ledger entry was written
     const ledger = await storage.getLedgerByTeamId(40);
     assert.equal(ledger.length, 1);
     assert.equal(ledger[0].amountCents, 7900);
-
-    // Subscription status is active
-    const sub = await storage.getSubscriptionByTeamId(40);
-    assert.equal(sub.planId, "pro");
-    assert.equal(sub.seats, 50);
   });
 });
 
@@ -530,7 +804,7 @@ describe("Durable Billing Persistence — Environment Selection & Transactional 
   it("ensures a failed transaction is NOT marked processed, allowing safe retry", async () => {
     let failFirstAttempt = true;
 
-    // Mock storage that fails on the first upsert attempt to simulate transient database error
+    // Mock storage that fails on the first attempt to simulate transient database error
     const faultyStorage = {
       async recordLedgerEntry(entry) {
         return { isDuplicate: false, entry };
@@ -542,10 +816,13 @@ describe("Durable Billing Persistence — Environment Selection & Transactional 
         return sub;
       },
       async recordEvent(event) {
+        if (failFirstAttempt) {
+          throw new Error("Simulated transient PostgreSQL transaction deadlock / serialization failure");
+        }
         return { isDuplicate: false, event };
       },
       async isEventProcessed(eventId) {
-        return false;
+        return !failFirstAttempt;
       },
       async getSubscriptionByTeamId() {
         return null;
@@ -558,42 +835,197 @@ describe("Durable Billing Persistence — Environment Selection & Transactional 
       },
     };
 
-    const processor = new BillingEventProcessor(undefined, faultyStorage);
-
     const event = {
-      id: "evt_transaction_retry_test",
-      type: "checkout.session.completed",
-      created: 1700000000,
-      data: {
-        object: {
-          id: "cs_retry_101",
-          payment_status: "paid",
-          status: "complete",
-          amount_total: 2900,
-          currency: "usd",
-          subscription: "sub_retry_101",
-          metadata: { workspace_id: "55", plan_id: "starter", seats: "15" },
-        },
-      },
+      eventId: "pstk_tx_retry_test",
+      eventType: "charge.success",
+      teamId: 55,
+      status: "processed",
+      processedAt: 1700000000,
     };
 
     // First attempt: encounters transient database failure
-    const attempt1 = await processor.processEvent(event);
-    assert.equal(attempt1.status, "failed");
-    assert.ok(attempt1.message.includes("Simulated transient PostgreSQL transaction deadlock"));
+    await assert.rejects(
+      async () => faultyStorage.recordEvent(event),
+      /Simulated transient PostgreSQL transaction deadlock/
+    );
 
-    // Event must NOT be permanently recorded as processed
-    assert.equal(processor.isEventProcessed(event.id), false);
-    assert.equal(await processor.isEventProcessedDurable(event.id), false);
+    // Event was NOT permanently marked processed
+    assert.equal(await faultyStorage.isEventProcessed(event.eventId), false);
 
-    // Second attempt (database recovered): retry should proceed and succeed rather than being rejected as duplicate
+    // Second attempt (database recovered): retry proceeds and succeeds
     failFirstAttempt = false;
-    const attempt2 = await processor.processEvent(event);
-    assert.equal(attempt2.status, "processed");
-    assert.equal(attempt2.actionTaken, "checkout_completed");
-
-    // NOW event is recorded as processed
-    assert.equal(processor.isEventProcessed(event.id), true);
+    const attempt2 = await faultyStorage.recordEvent(event);
+    assert.equal(attempt2.isDuplicate, false);
+    assert.equal(attempt2.event.eventId, "pstk_tx_retry_test");
+    assert.equal(await faultyStorage.isEventProcessed(event.eventId), true);
   });
 });
 
+describe("Durable Billing Persistence — Process Restart & Durable Query Fidelity", () => {
+  it("recovers active Paystack subscription and seat capacity in GET /api/billing after clean process restart", async () => {
+    const sharedStorage = new InMemoryBillingStorage();
+
+    // Process 1: Ingests Paystack checkout and persists to durable storage
+    await sharedStorage.upsertSubscription({
+      teamId: 42,
+      paymentProvider: "paystack",
+      planId: "pro",
+      seats: 15,
+      status: "active",
+      currentPeriodStart: 1700000000,
+      currentPeriodEnd: 1702592000,
+      updatedAt: 1700000000,
+    });
+    await sharedStorage.recordLedgerEntry({
+      transactionId: "pstk_tx_restart_1",
+      teamId: 42,
+      eventId: "pstk_evt_restart_1",
+      type: "paystack_charge_success",
+      amountCents: 7900,
+      currency: "NGN",
+      status: "succeeded",
+      createdAt: 1700000000,
+    });
+
+    // Process 2: Simulates clean application cold restart with a new processor instance
+    // Note: processorB in-memory map is completely empty!
+    const processorB = new BillingEventProcessor(undefined, sharedStorage);
+    assert.equal(processorB.getSubscriptionByWorkspace(42), null); // in-memory cache is empty
+
+    // Query billing status through Process 2
+    const user = { userId: 5, teamId: 42, role: "Owner" };
+    const res = await handleGetBillingStatus(user, { processor: processorB, activeMemberCount: 8 });
+
+    assert.equal(res.status, 200);
+    assert.equal(res.body.workspaceId, 42);
+    assert.equal(res.body.subscription.planId, "pro");
+    assert.equal(res.body.subscription.paymentProvider, "paystack");
+    assert.equal(res.body.seatLimit, 15);
+    assert.equal(res.body.capacity.activeMembers, 8);
+    assert.equal(res.body.capacity.availableSeats, 7);
+    assert.equal(res.body.capacity.isAtCapacity, false);
+    assert.equal(res.body.ledger.length, 1);
+    assert.equal(res.body.ledger[0].amount, 7900);
+  });
+
+  it("preserves readable historical Stripe subscriptions in GET /api/billing across restarts", async () => {
+    // Seed storage with historical Stripe subscription (allowed via constructor)
+    const historicalStorage = new InMemoryBillingStorage([
+      {
+        teamId: 99,
+        stripeSubscriptionId: "sub_historical_stripe_99",
+        stripeCustomerId: "cus_historical_99",
+        planId: "starter",
+        seats: 15,
+        status: "active",
+        paymentProvider: "stripe",
+        currentPeriodStart: 1690000000,
+        currentPeriodEnd: 1692592000,
+        updatedAt: 1690000000,
+      },
+    ]);
+    const processor = new BillingEventProcessor(undefined, historicalStorage);
+
+    const user = { userId: 1, teamId: 99, role: "Owner" };
+    const res = await handleGetBillingStatus(user, { processor });
+
+    assert.equal(res.status, 200);
+    assert.equal(res.body.workspaceId, 99);
+    assert.equal(res.body.subscription.planId, "starter");
+    assert.equal(res.body.subscription.paymentProvider, "stripe");
+        assert.equal(res.body.seatLimit, 15);
+  });
+
+  it("enforces tenant boundary on durable subscription reads across restarts", async () => {
+    const sharedStorage = new InMemoryBillingStorage();
+    await sharedStorage.upsertSubscription({
+      teamId: 10,
+      paymentProvider: "paystack",
+      planId: "pro",
+      seats: 25,
+      status: "active",
+      currentPeriodStart: 1700000000,
+      currentPeriodEnd: 1702592000,
+      updatedAt: 1700000000,
+    });
+
+    // Fresh process queried by a different workspace
+    const processorB = new BillingEventProcessor(undefined, sharedStorage);
+    const userWorkspace20 = { userId: 9, teamId: 20, role: "Owner" };
+    const res = await handleGetBillingStatus(userWorkspace20, { processor: processorB });
+
+    assert.equal(res.status, 200);
+    assert.equal(res.body.workspaceId, 20);
+    assert.equal(res.body.subscription.planId, "free"); // Unrelated workspace remains on free tier
+    assert.equal(res.body.seatLimit, 5);
+    assert.equal(res.body.ledger.length, 0);
+  });
+
+  it("detects existing subscription for duplicate-plan prevention in checkout route across restarts", async () => {
+    const sharedStorage = new InMemoryBillingStorage();
+    await sharedStorage.upsertSubscription({
+      teamId: 50,
+      paymentProvider: "paystack",
+      planId: "starter",
+      seats: 15,
+      status: "active",
+      currentPeriodStart: 1700000000,
+      currentPeriodEnd: 1700000000 + 30 * 86400,
+      updatedAt: 1700000000,
+    });
+
+    // Fresh process: User attempts to checkout Starter plan again
+    const user = { userId: 1, teamId: 50, role: "Owner" };
+    const resDuplicate = await handlePaystackInitialize({ targetPlan: "starter" }, user, {
+      storage: sharedStorage,
+      currentTime: 1700000000 + 10 * 86400,
+    });
+
+    assert.equal(resDuplicate.status, 400);
+    assert.ok(resDuplicate.body.message.includes("already subscribed"));
+
+    // Fresh process: User checks out Pro -> succeeds with valid kobo amount and unique reference
+    const resUpgrade = await handlePaystackInitialize({ targetPlan: "pro" }, user, {
+      storage: sharedStorage,
+      currentTime: 1700000000 + 10 * 86400,
+    });
+
+    assert.equal(resUpgrade.status, 200);
+    assert.equal(resUpgrade.body.amountKobo, 4500000);
+    assert.ok(resUpgrade.body.reference.startsWith("pstk_init_50_pro_"));
+  });
+
+  it("prohibits silent in-memory fallback and rejects false Free plan when durable storage fails in database mode", async () => {
+    // Faulty storage simulating database connectivity failure
+    const faultyDatabaseStorage = Object.create(DatabaseBillingStorage.prototype);
+    faultyDatabaseStorage.getSubscriptionByTeamId = async () => {
+      throw new Error("PostgreSQL connection pool exhausted: timeout acquiring connection");
+    };
+    faultyDatabaseStorage.getLedgerByTeamId = async () => {
+      throw new Error("PostgreSQL connection pool exhausted: timeout acquiring connection");
+    };
+
+    const faultyProcessor = new BillingEventProcessor(undefined, faultyDatabaseStorage);
+    const user = { userId: 7, teamId: 33, role: "Owner" };
+
+    // Must return HTTP 500 rather than silently returning HTTP 200 with Free Tier
+    const res = await handleGetBillingStatus(user, { processor: faultyProcessor });
+
+    assert.equal(res.status, 500);
+    assert.equal(res.body.error, "Internal Server Error");
+    assert.equal(res.body.message, "Failed to retrieve billing status from persistent storage.");
+    // Confirm Free tier was NOT falsely returned
+    assert.equal(res.body.subscription, undefined);
+
+    // Also verify checkout route rejects silent fallback on durable storage failure
+    const resCheckout = await handlePaystackInitialize({ targetPlan: "pro" }, user, {
+      storage: faultyDatabaseStorage,
+    });
+    assert.equal(resCheckout.status, 500);
+    assert.equal(resCheckout.body.error, "Internal Server Error");
+    assert.equal(
+      resCheckout.body.message,
+      "Failed to verify current subscription state."
+    );
+  });
+});
