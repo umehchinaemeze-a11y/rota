@@ -1,9 +1,18 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  turbopack: {
+    rules: {
+      "*.css": {
+        loaders: ["@tailwindcss/turbopack"],
+        as: "*.css",
+      },
+    },
+  },
   experimental: {
     agentFeedback: true,
+    turbopackPluginRuntimeStrategy: "forceWorkerThreads",
+    cpus: 1,
   },
   cacheComponents: true,
   partialPrefetching: true,
