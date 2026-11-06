@@ -16,6 +16,7 @@ import {
   resolveBillingVerificationBadge,
   type PaymentProvider,
 } from "@/lib/billing-provider-badge";
+import GoogleAccountSettings from "./google-account-settings";
 
 type AuthUser = {
   id: number;
@@ -23,6 +24,8 @@ type AuthUser = {
   name: string;
   role: string;
   teamId?: number | null;
+  hasPassword?: boolean;
+  googleLinked?: boolean;
 };
 
 type UserWorkspace = {
@@ -451,6 +454,14 @@ export default function Home() {
             const params = new URLSearchParams(window.location.search);
             const pstkRef = params.get("reference") || params.get("trxref");
             const pstkStatus = params.get("status");
+            const googleStatus = params.get("google");
+            const googleError = params.get("google_error");
+
+            if (googleStatus === "linked") {
+              setNotice("Google account linked successfully.");
+            } else if (googleError === "link_conflict") {
+              setNotice("That Google account is already linked to another Rota user.");
+            }
 
             if (pstkStatus === "cancelled" || pstkStatus === "failed") {
               setNotice("Paystack payment checkout was cancelled or failed. No charges were made.");
@@ -1457,6 +1468,18 @@ export default function Home() {
                       </div>
                     </div>
                   </div>
+
+                  {currentUser && (
+                    <div className="mt-6">
+                      <GoogleAccountSettings
+                        googleLinked={Boolean(currentUser.googleLinked)}
+                        hasPassword={Boolean(currentUser.hasPassword)}
+                        onStatusChange={async () => {
+                          await checkSession();
+                        }}
+                      />
+                    </div>
+                  )}
 
                   <div className="mt-6 border-t border-slate-100 pt-6">
                     <h3 className="text-sm font-bold text-slate-900 mb-3">

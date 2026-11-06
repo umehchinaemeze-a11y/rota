@@ -12,6 +12,31 @@ export async function GET(request: Request) {
       );
     }
 
+    const { sql } = await import("@/lib/db");
+    let hasPassword = false;
+    let googleLinked = false;
+
+    const passwordRows = await sql`
+      SELECT (password_hash IS NOT NULL AND password_salt IS NOT NULL) AS has_password
+      FROM users
+      WHERE id = ${sessionUser.userId}
+      LIMIT 1;
+    `;
+    hasPassword = passwordRows?.[0]?.has_password === true;
+
+    try {
+      const identityRows = await sql`
+        SELECT id
+        FROM user_identities
+        WHERE user_id = ${sessionUser.userId}
+          AND provider = 'google'
+        LIMIT 1;
+      `;
+      googleLinked = Array.isArray(identityRows) && identityRows.length > 0;
+    } catch {
+      googleLinked = false;
+    }
+
     // Return only safe profile fields. Never return password hashes, salts, secrets, or tokens.
     return NextResponse.json(
       {
@@ -22,6 +47,8 @@ export async function GET(request: Request) {
           name: sessionUser.name,
           role: sessionUser.role,
           teamId: sessionUser.teamId ?? null,
+          hasPassword,
+          googleLinked,
         },
       },
       { status: 200 }

@@ -80,6 +80,14 @@ export async function handleLogin(
 
     const user = rows[0];
 
+    // Users created through Google have no password until one is explicitly set.
+    if (!user.password_hash || !user.password_salt) {
+      return Response.json(
+        { error: "Invalid email or password." },
+        { status: 401 }
+      );
+    }
+
     // Constant-time verification against stored scrypt hash and salt
     const isPasswordValid = verifyPassword(
       password,

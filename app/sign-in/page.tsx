@@ -13,7 +13,22 @@ function SignInForm() {
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(() => {
+    const code = searchParams.get("error");
+    if (code === "google_cancelled") {
+      return "Google sign-in was cancelled.";
+    }
+    if (code === "google_link_required") {
+      return "An account with this email already exists. Sign in with your password, then link Google from Settings.";
+    }
+    if (code === "google_failed") {
+      return "Google sign-in could not be completed. Please try again.";
+    }
+    if (code === "google_unavailable") {
+      return "Google sign-in is not available right now.";
+    }
+    return null;
+  });
 
   // Check if user is already authenticated in the background without blocking the form
   useEffect(() => {
@@ -236,6 +251,45 @@ function SignInForm() {
           "Sign In"
         )}
       </button>
+
+      <div className="relative py-1">
+        <div className="absolute inset-0 flex items-center" aria-hidden="true">
+          <div className="w-full border-t border-slate-200" />
+        </div>
+        <div className="relative flex justify-center text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+          <span className="bg-white px-3">or</span>
+        </div>
+      </div>
+
+      <a
+        href={`/api/auth/google/start?redirect=${encodeURIComponent(redirectPath)}`}
+        className="w-full flex items-center justify-center gap-3 rounded-xl border border-slate-200 bg-white py-3 px-4 text-sm font-semibold text-slate-800 shadow-xs hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-slate-900/20 transition"
+      >
+        <svg
+          className="h-4 w-4"
+          viewBox="0 0 24 24"
+          aria-hidden="true"
+          focusable="false"
+        >
+          <path
+            fill="#4285F4"
+            d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.27-4.74 3.27-8.1Z"
+          />
+          <path
+            fill="#34A853"
+            d="M12 23c2.97 0 5.46-.98 7.28-2.65l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.15-4.53H2.18v2.84A11 11 0 0 0 12 23Z"
+          />
+          <path
+            fill="#FBBC05"
+            d="M5.85 14.11a6.6 6.6 0 0 1 0-4.22V7.05H2.18a11 11 0 0 0 0 9.9l3.67-2.84Z"
+          />
+          <path
+            fill="#EA4335"
+            d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15A10.6 10.6 0 0 0 12 1a11 11 0 0 0-9.82 6.05l3.67 2.84C6.71 7.3 9.14 5.38 12 5.38Z"
+          />
+        </svg>
+        Continue with Google
+      </a>
 
       <div className="pt-2 text-center text-xs text-slate-500">
         Don&apos;t have an account?{" "}
