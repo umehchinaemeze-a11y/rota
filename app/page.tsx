@@ -1961,8 +1961,14 @@ export default function Home() {
               </>
             )}
 
-            <footer className="mt-12 border-t border-slate-200 py-6 text-xs text-slate-400">
-              Rota · Team scheduling workspace · Connected to Neon PostgreSQL
+            <footer className="mt-12 border-t border-slate-200 py-6 text-xs text-slate-400 flex flex-col sm:flex-row items-center justify-between gap-2">
+              <span>Rota · Team scheduling workspace · Connected to Neon PostgreSQL</span>
+              <Link
+                href="/privacy"
+                className="text-slate-500 hover:text-slate-800 underline transition"
+              >
+                Privacy Policy
+              </Link>
             </footer>
           </div>
         </section>
