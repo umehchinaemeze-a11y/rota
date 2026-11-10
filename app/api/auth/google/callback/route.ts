@@ -27,6 +27,10 @@ import {
   recordGoogleLogin,
 } from "../../../../../lib/oauth/users.ts";
 import { createUserSessionCookie } from "../../../../../lib/oauth/session.ts";
+import {
+  createAuthSession,
+  serializeRefreshCookie,
+} from "../../../../../lib/refresh-tokens.ts";
 import { sql as defaultSql } from "../../../../../lib/db.ts";
 
 export type GoogleCallbackDependencies = {
@@ -51,11 +55,15 @@ function redirectWithClearedState(
 function redirectWithSession(
   request: Request,
   path: string,
-  sessionCookie: string
+  sessionCookie: string,
+  refreshCookie?: string
 ): Response {
   const response = redirectResponse(new URL(path, request.url));
   response.headers.append("Set-Cookie", clearOAuthStateCookie(request));
   response.headers.append("Set-Cookie", sessionCookie);
+  if (refreshCookie) {
+    response.headers.append("Set-Cookie", refreshCookie);
+  }
   return response;
 }
 
@@ -106,8 +114,19 @@ async function completeLogin(
     }
   }
 
-  const sessionCookie = createUserSessionCookie(user, secret);
-  return redirectWithSession(request, safelyRedirectAfter(tx), sessionCookie);
+  const userAgent = request.headers.get("user-agent") ?? undefined;
+  const ipAddress =
+    request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? undefined;
+
+  const authSession = await createAuthSession(executeSql, {
+    userId: user.id,
+    userAgent,
+    ipAddress,
+  });
+
+  const sessionCookie = createUserSessionCookie(user, secret, authSession.sessionId);
+  const refreshCookie = serializeRefreshCookie(authSession.refreshToken, undefined, request);
+  return redirectWithSession(request, safelyRedirectAfter(tx), sessionCookie, refreshCookie);
 }
 
 async function completeLink(

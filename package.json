@@ -7,7 +7,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "node --experimental-strip-types --test tests/shifts.test.mjs tests/proration.test.mjs tests/team-isolation.test.mjs tests/auth.test.mjs tests/billing-webhook.test.mjs tests/load-test-safety.test.mjs tests/database-safety-hardening.test.mjs tests/shift-recovery.test.mjs tests/billing-persistence.test.mjs tests/teams.test.mjs tests/default-membership-migration.test.mjs tests/db.test.mjs tests/paystack-phase1.test.mjs tests/paystack-storage.test.mjs tests/paystack-checkout.test.mjs tests/paystack-webhook.test.mjs tests/paystack-renewal.test.mjs tests/paystack-frontend.test.mjs tests/google-auth.test.mjs"
+    "check:redis": "node --experimental-strip-types scripts/check-redis.mjs",
+    "verify:redis": "node --experimental-strip-types scripts/verify-redis-live.mjs",
+    "test": "node --experimental-strip-types --test tests/shifts.test.mjs tests/proration.test.mjs tests/team-isolation.test.mjs tests/auth.test.mjs tests/billing-webhook.test.mjs tests/load-test-safety.test.mjs tests/database-safety-hardening.test.mjs tests/shift-recovery.test.mjs tests/billing-persistence.test.mjs tests/teams.test.mjs tests/default-membership-migration.test.mjs tests/db.test.mjs tests/paystack-phase1.test.mjs tests/paystack-storage.test.mjs tests/paystack-checkout.test.mjs tests/paystack-webhook.test.mjs tests/paystack-renewal.test.mjs tests/paystack-frontend.test.mjs tests/google-auth.test.mjs tests/invitations.test.mjs tests/offline-shifts.test.mjs tests/shifts-sync.test.mjs tests/shift-swaps.test.mjs tests/notifications.test.mjs tests/user-settings.test.mjs tests/refresh-tokens.test.mjs tests/activity-feed.test.mjs tests/fcm.test.mjs tests/db-cluster.test.mjs tests/cache.test.mjs tests/security-auth.test.mjs tests/mobile.test.mjs tests/redis-infrastructure.test.mjs"
   },
   "dependencies": {
     "@capacitor/android": "^8.5.3",

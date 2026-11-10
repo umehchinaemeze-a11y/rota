@@ -1,5 +1,6 @@
 import { canManageTeamShiftRecord, isManagerRole } from "../../../../lib/permissions.ts";
 import type { SessionPayload } from "../../../../lib/auth.ts";
+import { invalidateTeamCache, type CacheStore } from "../../../../lib/cache.ts";
 
 export type RouteContext = {
   params: Promise<{ id: string }>;
@@ -8,16 +9,29 @@ export type RouteContext = {
 export type ShiftItemRouteDependencies = {
   sql?: (strings: TemplateStringsArray, ...values: any[]) => Promise<any>;
   getSessionUser?: (options?: { revalidateWithDb?: boolean }) => Promise<SessionPayload | null>;
+  dispatchNotification?: (sql: any, options: any) => Promise<any>;
+  cacheStore?: CacheStore;
 };
 
-let prodDepsPromise: Promise<Required<ShiftItemRouteDependencies>> | null = null;
+type ProductionDependencies = {
+  sql: (strings: TemplateStringsArray, ...values: any[]) => Promise<any>;
+  getSessionUser: (options?: { revalidateWithDb?: boolean }) => Promise<SessionPayload | null>;
+  dispatchNotification: (sql: any, options: any) => Promise<any>;
+};
 
-async function loadProductionDependencies(): Promise<Required<ShiftItemRouteDependencies>> {
+let prodDepsPromise: Promise<ProductionDependencies> | null = null;
+
+async function loadProductionDependencies(): Promise<ProductionDependencies> {
   if (!prodDepsPromise) {
     prodDepsPromise = Promise.all([
       import("@/lib/db"),
       import("@/lib/session"),
-    ]).then(([{ sql }, { getSessionUser }]) => ({ sql, getSessionUser }));
+      import("../../../../lib/notifications-dispatch.ts"),
+    ]).then(([{ sql }, { getSessionUser }, { dispatchNotification }]) => ({
+      sql,
+      getSessionUser,
+      dispatchNotification,
+    }));
   }
   return prodDepsPromise;
 }
@@ -28,9 +42,8 @@ export async function handleGetShiftById(
   dependencies?: ShiftItemRouteDependencies
 ): Promise<Response> {
   try {
-    const resolveSessionUser =
-      dependencies?.getSessionUser ??
-      (await loadProductionDependencies()).getSessionUser;
+    const prodDeps = dependencies?.getSessionUser && dependencies?.sql ? null : await loadProductionDependencies();
+    const resolveSessionUser = dependencies?.getSessionUser ?? prodDeps!.getSessionUser;
 
     // 1. Authenticate caller and obtain authoritative team membership
     const sessionUser = await resolveSessionUser({ revalidateWithDb: true });
@@ -56,8 +69,7 @@ export async function handleGetShiftById(
     }
 
     const executeSql =
-      dependencies?.sql ??
-      (await loadProductionDependencies()).sql;
+      dependencies?.sql ?? prodDeps!.sql;
 
     // 2. Query shift strictly scoped by both shift ID and authenticated user's team ID.
     // Shifts belonging to other teams return 404 to avoid leaking existence.
@@ -103,9 +115,9 @@ export async function handlePutShift(
   dependencies?: ShiftItemRouteDependencies
 ): Promise<Response> {
   try {
+    const prodDeps = dependencies?.getSessionUser && dependencies?.sql ? null : await loadProductionDependencies();
     const resolveSessionUser =
-      dependencies?.getSessionUser ??
-      (await loadProductionDependencies()).getSessionUser;
+      dependencies?.getSessionUser ?? prodDeps!.getSessionUser;
 
     // 1. Authenticate caller and obtain authoritative team membership
     const sessionUser = await resolveSessionUser({ revalidateWithDb: true });
@@ -171,8 +183,7 @@ export async function handlePutShift(
     }
 
     const executeSql =
-      dependencies?.sql ??
-      (await loadProductionDependencies()).sql;
+      dependencies?.sql ?? prodDeps!.sql;
 
     // 4. Retrieve existing shift from database scoped to team_id.
     // Cross-team updates return 404 to avoid leaking shift existence across tenants.
@@ -276,6 +287,60 @@ export async function handlePutShift(
         created_at;
     `;
 
+    // 8. Notify assigned employee of update if modified by another team member
+    if (
+      updatedUserId &&
+      Number(updatedUserId) !== Number(sessionUser.userId) &&
+      (!dependencies?.sql || dependencies?.dispatchNotification)
+    ) {
+      try {
+        const dispatchFn =
+          dependencies?.dispatchNotification ??
+          prodDeps?.dispatchNotification ??
+          (await import("../../../../lib/notifications-dispatch.ts")).dispatchNotification;
+        await dispatchFn(executeSql, {
+          teamId: sessionUser.teamId,
+          targetUserId: Number(updatedUserId),
+          category: "shift_updated",
+          entityId: numericId,
+          revision: `${numericId}-${Date.now()}`,
+          payload: {
+            employeeName: updatedEmployeeName,
+            shiftDay,
+            role,
+          },
+        });
+      } catch (err) {
+        console.warn("Failed to dispatch shift_updated notification:", err);
+      }
+    }
+
+    // 9. Record workspace activity event (in production when not overridden by isolated unit test mocks)
+    if (!dependencies?.sql) {
+      try {
+        const { recordActivityEvent } = await import("../../../../lib/activity.ts");
+        await recordActivityEvent(executeSql, {
+          teamId: sessionUser.teamId,
+          userId: sessionUser.userId,
+          actorName: sessionUser.name,
+          action: "shift_updated",
+          entityType: "shift",
+          entityId: numericId,
+          description: `Updated shift for ${updatedEmployeeName} (${role}) on ${shiftDay}.`,
+          metadata: { role, shiftDay, assignedUserId: updatedUserId },
+        });
+      } catch {
+        // Activity logging fails open
+      }
+    }
+
+    // Invalidate cached schedule and roster for this team
+    try {
+      await invalidateTeamCache(sessionUser.teamId, dependencies?.cacheStore);
+    } catch {
+      // Invalidation fails open
+    }
+
     return Response.json(result[0], { status: 200 });
   } catch (error) {
     console.error("Failed to update shift:", error);
@@ -300,9 +365,9 @@ export async function handleDeleteShift(
   dependencies?: ShiftItemRouteDependencies
 ): Promise<Response> {
   try {
+    const prodDeps = dependencies?.getSessionUser && dependencies?.sql ? null : await loadProductionDependencies();
     const resolveSessionUser =
-      dependencies?.getSessionUser ??
-      (await loadProductionDependencies()).getSessionUser;
+      dependencies?.getSessionUser ?? prodDeps!.getSessionUser;
 
     // 1. Authenticate caller and obtain authoritative team membership
     const sessionUser = await resolveSessionUser({ revalidateWithDb: true });
@@ -328,8 +393,7 @@ export async function handleDeleteShift(
     }
 
     const executeSql =
-      dependencies?.sql ??
-      (await loadProductionDependencies()).sql;
+      dependencies?.sql ?? prodDeps!.sql;
 
     // 3. Retrieve existing shift from database scoped to team_id.
     // Cross-team deletions return 404 to avoid leaking shift existence.
@@ -363,6 +427,31 @@ export async function handleDeleteShift(
       DELETE FROM shifts
       WHERE id = ${numericId} AND team_id = ${sessionUser.teamId};
     `;
+
+    // 6. Record workspace activity event (in production when not overridden by isolated unit test mocks)
+    if (!dependencies?.sql) {
+      try {
+        const { recordActivityEvent } = await import("../../../../lib/activity.ts");
+        await recordActivityEvent(executeSql, {
+          teamId: sessionUser.teamId,
+          userId: sessionUser.userId,
+          actorName: sessionUser.name,
+          action: "shift_deleted",
+          entityType: "shift",
+          entityId: numericId,
+          description: `Cancelled shift on ${existingShift.shift_day} for ${existingShift.employee_name}.`,
+        });
+      } catch {
+        // Activity logging fails open
+      }
+    }
+
+    // Invalidate cached schedule and roster for this team
+    try {
+      await invalidateTeamCache(sessionUser.teamId, dependencies?.cacheStore);
+    } catch {
+      // Invalidation fails open
+    }
 
     return Response.json(
       { success: true, message: "Shift permanently removed.", id: numericId },

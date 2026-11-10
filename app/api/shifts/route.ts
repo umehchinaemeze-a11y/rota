@@ -1,19 +1,38 @@
 import { isManagerRole } from "../../../lib/permissions.ts";
 import type { SessionPayload } from "../../../lib/auth.ts";
+import {
+  getCachedShiftSchedule,
+  invalidateTeamCache,
+  type CacheStore,
+} from "../../../lib/cache.ts";
 
 export type ShiftRouteDependencies = {
   sql?: (strings: TemplateStringsArray, ...values: any[]) => Promise<any>;
   getSessionUser?: (options?: { revalidateWithDb?: boolean }) => Promise<SessionPayload | null>;
+  dispatchNotification?: (sql: any, options: any) => Promise<any>;
+  cacheStore?: CacheStore;
+  skipCache?: boolean;
 };
 
-let prodDepsPromise: Promise<Required<ShiftRouteDependencies>> | null = null;
+type ProductionDependencies = {
+  sql: (strings: TemplateStringsArray, ...values: any[]) => Promise<any>;
+  getSessionUser: (options?: { revalidateWithDb?: boolean }) => Promise<SessionPayload | null>;
+  dispatchNotification: (sql: any, options: any) => Promise<any>;
+};
 
-async function loadProductionDependencies(): Promise<Required<ShiftRouteDependencies>> {
+let prodDepsPromise: Promise<ProductionDependencies> | null = null;
+
+async function loadProductionDependencies(): Promise<ProductionDependencies> {
   if (!prodDepsPromise) {
     prodDepsPromise = Promise.all([
       import("@/lib/db"),
       import("@/lib/session"),
-    ]).then(([{ sql }, { getSessionUser }]) => ({ sql, getSessionUser }));
+      import("../../../lib/notifications-dispatch.ts"),
+    ]).then(([{ sql }, { getSessionUser }, { dispatchNotification }]) => ({
+      sql,
+      getSessionUser,
+      dispatchNotification,
+    }));
   }
   return prodDepsPromise;
 }
@@ -22,9 +41,9 @@ export async function handleGetShifts(
   dependencies?: ShiftRouteDependencies
 ): Promise<Response> {
   try {
+    const prodDeps = dependencies?.getSessionUser && dependencies?.sql ? null : await loadProductionDependencies();
     const resolveSessionUser =
-      dependencies?.getSessionUser ??
-      (await loadProductionDependencies()).getSessionUser;
+      dependencies?.getSessionUser ?? prodDeps!.getSessionUser;
 
     const sessionUser = await resolveSessionUser({ revalidateWithDb: true });
     if (!sessionUser) {
@@ -42,22 +61,46 @@ export async function handleGetShifts(
     }
 
     const executeSql =
-      dependencies?.sql ??
-      (await loadProductionDependencies()).sql;
+      dependencies?.sql ?? prodDeps!.sql;
 
-    const shifts = await executeSql`
-      SELECT
-        id,
-        employee_name,
-        role,
-        user_id,
-        team_id,
-        TO_CHAR(shift_day, 'YYYY-MM-DD') AS shift_day,
-        created_at
-      FROM shifts
-      WHERE team_id = ${sessionUser.teamId}
-      ORDER BY shift_day ASC, id ASC
-    `;
+    let shifts: any[];
+    if (dependencies?.skipCache) {
+      shifts = await executeSql`
+        SELECT
+          id,
+          employee_name,
+          role,
+          user_id,
+          team_id,
+          TO_CHAR(shift_day, 'YYYY-MM-DD') AS shift_day,
+          created_at
+        FROM shifts
+        WHERE team_id = ${sessionUser.teamId}
+        ORDER BY shift_day ASC, id ASC
+      `;
+    } else {
+      const { data } = await getCachedShiftSchedule(
+        sessionUser.teamId,
+        "all",
+        async () => {
+          return executeSql`
+            SELECT
+              id,
+              employee_name,
+              role,
+              user_id,
+              team_id,
+              TO_CHAR(shift_day, 'YYYY-MM-DD') AS shift_day,
+              created_at
+            FROM shifts
+            WHERE team_id = ${sessionUser.teamId}
+            ORDER BY shift_day ASC, id ASC
+          `;
+        },
+        dependencies?.cacheStore
+      );
+      shifts = data;
+    }
 
     return Response.json(shifts);
   } catch (error) {
@@ -79,9 +122,9 @@ export async function handlePostShift(
   dependencies?: ShiftRouteDependencies
 ): Promise<Response> {
   try {
+    const prodDeps = dependencies?.getSessionUser && dependencies?.sql ? null : await loadProductionDependencies();
     const resolveSessionUser =
-      dependencies?.getSessionUser ??
-      (await loadProductionDependencies()).getSessionUser;
+      dependencies?.getSessionUser ?? prodDeps!.getSessionUser;
 
     // 1. Authenticate session and fetch authoritative role from database
     const sessionUser = await resolveSessionUser({ revalidateWithDb: true });
@@ -148,8 +191,7 @@ export async function handlePostShift(
     let finalUserId = sessionUser.userId;
 
     const executeSql =
-      dependencies?.sql ??
-      (await loadProductionDependencies()).sql;
+      dependencies?.sql ?? prodDeps!.sql;
 
     if (isManager) {
       // Managers may schedule for another employee in the SAME team if provided in the body
@@ -214,6 +256,59 @@ export async function handlePostShift(
         TO_CHAR(shift_day, 'YYYY-MM-DD') AS shift_day,
         created_at;
     `;
+
+    // 5. Notify assigned employee asynchronously
+    if (
+      finalUserId &&
+      Number(finalUserId) !== Number(sessionUser.userId) &&
+      (!dependencies?.sql || dependencies?.dispatchNotification)
+    ) {
+      try {
+        const dispatchFn =
+          dependencies?.dispatchNotification ??
+          prodDeps?.dispatchNotification ??
+          (await import("../../../lib/notifications-dispatch.ts")).dispatchNotification;
+        await dispatchFn(executeSql, {
+          teamId: sessionUser.teamId,
+          targetUserId: Number(finalUserId),
+          category: "shift_assigned",
+          entityId: result[0].id,
+          payload: {
+            employeeName: finalEmployeeName,
+            shiftDay,
+            role: finalRole,
+          },
+        });
+      } catch (err) {
+        console.warn("Failed to dispatch shift_assigned notification:", err);
+      }
+    }
+
+    // 6. Record workspace activity event (in production when not overridden by isolated unit test mocks)
+    if (!dependencies?.sql) {
+      try {
+        const { recordActivityEvent } = await import("../../../lib/activity.ts");
+        await recordActivityEvent(executeSql, {
+          teamId: sessionUser.teamId,
+          userId: sessionUser.userId,
+          actorName: sessionUser.name,
+          action: "shift_created",
+          entityType: "shift",
+          entityId: result[0].id,
+          description: `Scheduled shift for ${finalEmployeeName} (${finalRole}) on ${shiftDay}.`,
+          metadata: { role: finalRole, shiftDay, assignedUserId: finalUserId },
+        });
+      } catch {
+        // Activity logging fails open
+      }
+    }
+
+    // Invalidate cached schedule and roster for this team
+    try {
+      await invalidateTeamCache(sessionUser.teamId, dependencies?.cacheStore);
+    } catch {
+      // Invalidation fails open
+    }
 
     return Response.json(result[0], { status: 201 });
   } catch (error) {

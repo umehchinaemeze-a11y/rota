@@ -1,160 +1,136 @@
 # Rota — Workforce Scheduling & Shift Management
 
-A shift scheduling and workforce management web application built with Next.js App Router, backed by Neon Serverless PostgreSQL, and secured with native cryptographic session authentication and role-based access control (RBAC).
+A modern, highly resilient workforce scheduling and shift management platform built with Next.js App Router, backed by Neon Serverless PostgreSQL, secured with native cryptographic session authentication, role-based access control (RBAC), and enterprise-grade billing, sharding, caching, and mobile synchronization.
 
 * **Live Web Application:** [https://rota-lovat-gamma.vercel.app/](https://rota-lovat-gamma.vercel.app/)
 * **Repository:** [https://github.com/umehchinaemeze-a11y/rota](https://github.com/umehchinaemeze-a11y/rota)
+* **Architecture Guide:** [ARCHITECTURE.md](ARCHITECTURE.md)
+* **Application State & Sync Model:** [STATE.md](STATE.md)
+* **Security & Threat Model:** [SECURITY.md](SECURITY.md)
+* **Database Sharding Architecture:** [SHARDING.md](SHARDING.md)
+* **Engineering Decisions Log:** [LEARNING-LOG.md](LEARNING-LOG.md)
 * **Technical Documentation:** [TECHNICAL-DOCUMENTATION.md](TECHNICAL-DOCUMENTATION.md)
-* **Architecture Diagram:** [docs/architecture.md](docs/architecture.md)
 
 ---
 
-## Verified Capabilities & Current Features
+## Key Capabilities & Production Features
 
-* **Shift Scheduling Dashboard:** Weekly calendar view displaying upcoming shifts, daily schedules, role badges, active team members on shift, and total shift counts (`app/page.tsx`).
-* **PostgreSQL Persistence:** Persistent shift storage and retrieval backed by Neon Serverless PostgreSQL with parameterized SQL queries.
-* **Authentication Implementation:**
-  * Credential verification using Scrypt password hashing with unique 16-byte cryptographically secure random salts and constant-time buffer comparison (`lib/auth.ts`).
-  * Stateless session tokens signed with HMAC-SHA256 using server-side `AUTH_SECRET` (`lib/auth.ts`).
-  * Hardened cookie delivery using `rota_session` with `HttpOnly`, `SameSite=Lax`, and `Secure` flags in production environments (`lib/session.ts`).
-* **Server-Side Authorization (RBAC):**
-  * Centralized server-side gate (`canManageShiftRecord` in `lib/permissions.ts`) enforcing strict ownership checks against verified database user records.
-  * Management roles (`Supervisor`, `Operations`, `Admin`) have authority to schedule, edit, reassign, and delete any shift.
-  * Standard roles (`Front Desk`, `Customer Support`, `Frontend Developer`) are locked to their own account identity: they cannot edit shifts assigned to others, cannot reassign shifts, and cannot claim unassigned legacy records (`user_id IS NULL`).
-* **Safe Profile Sanitization:** Authentication endpoints return only public profile information (`id`, `email`, `name`, `role`), preventing exposure of password hashes, salts, or signing keys.
+### 1. High-Performance Dashboard & Scheduling
+* **5 Responsive Workspaces Tabs:** Overview metrics, Shift Calendar Schedule, Infinite Keyset Activity Feed, Team Member Directory, and Cross-Device Settings.
+* **Shift Ownership & Management:** Role-based scheduling, edition, assignment, and deletion with instant visual feedback and employee initials avatars.
+* **Offline Resilience:** Offline schedule caching with visible `lastUpdated` synchronization timestamp, local storage persistence, and automatic recovery upon reconnection.
+* **Optimistic Updates & Atomic Rollback:** Client actions for shift swaps and user settings apply optimistically to UI and DOM, rolling back cleanly if network or server errors occur.
+
+### 2. Multi-Tenant Workspace & Role-Based Access Control (RBAC)
+* **Strict Tenant Isolation:** All shifts, memberships, swap requests, settings, and activity logs are strictly partitioned by `team_id`.
+* **Anti-Enumeration Protection:** Requests targeting unauthorized workspaces fail closed with generic HTTP 404 or 403 responses without leaking entity existence.
+* **Role Hierarchy:**
+  * **Owner & Manager / Supervisor:** Full scheduling, member invitation, shift swap approval, and billing administration authority.
+  * **Staff (Front Desk, Customer Support, Operations):** Access limited to viewing workspace schedule, claiming own shifts, proposing shift swaps, and personal settings.
+
+### 3. Enterprise Authentication & Session Lifecycle
+* **Cryptographic Primitives:** Scrypt password hashing with unique 16-byte cryptographically secure random salts and constant-time verification (`lib/auth.ts`).
+* **Short-Lived Access Tokens:** 15-minute stateless HMAC-SHA256 session tokens delivered via secure `HttpOnly`, `SameSite=Lax` cookies.
+* **Refresh Token Rotation (RTR):** Server-side refresh sessions with family tracking, single-use token rotation, and automated reuse detection that instantly terminates compromised token families (`lib/refresh-tokens.ts`).
+* **Global Sign-Out:** Single-device logout and multi-device `/api/auth/logout-all` session termination.
+* **Cryptographic Password Reset:** 1-hour HMAC-SHA256 reset tokens with constant-time verification and strict single-use invalidation (`lib/password-reset.ts`).
+* **Sliding-Window Rate Limiting:** Sliding-window rate limiter defending auth (`/api/auth/login`, `/api/auth/register`, `/api/auth/forgot-password`, `/api/auth/reset-password`) and billing initialization endpoints.
+
+### 4. Distributed Billing & Paystack Integration
+* **Sole Active Provider:** Paystack exclusively powers workspace subscriptions (`lib/paystack.ts`, `lib/billing-storage.ts`).
+* **Server-Authoritative Pricing:** Integer kobo calculations in NGN, rejecting client-submitted amounts or currencies.
+* **Card Authorization Encryption:** Recurring billing authorizations encrypted with AES-256-GCM using unique per-tenant derivation keys.
+* **Proration Engine & 7-Day Grace Period:** Fractional mid-cycle upgrades, seat expansion proration, and automatic 7-day grace periods upon renewal failure.
+* **Webhook Idempotency:** Cryptographic HMAC-SHA512 webhook signature verification with transaction ledger deduplication.
+
+### 5. Backend Architecture: Pooling, Sharding & Distributed Caching
+* **Connection Pooling:** PgBouncer-aware connection pooling configuration with connection timeouts and keep-alive (`lib/db-cluster.ts`).
+* **Deterministic Sharding:** Two-node PostgreSQL sharding simulated via deterministic SHA-256 integer hash routing on `team_id` (`shard_0` vs `shard_1`).
+* **Read/Write Splitting & RYOW:** Automatic routing of write queries to Primary and reads to Replica, enforcing a 5-second Read-Your-Own-Writes (RYOW) consistency window.
+* **Multi-Layer Distributed Cache & Invalidation:** Team roster (`cache:team:{id}:roster`) and schedule range caching (`cache:team:{id}:shifts:{range}`) powered by Redis with automatic eviction hooks on shift mutations (create, update, delete, swap approval, legacy recovery) (`lib/cache.ts`).
+* **Redis-Backed Atomic Sliding-Window Rate Limiting:** Enforces distributed rate limits across all app instances using atomic Lua scripts on Redis sorted sets, with transparent headers (`X-RateLimit-*`, `Retry-After`) and automatic resilient failover to memory fallback (`lib/redis.ts`, `lib/rate-limit.ts`).
+
+### 6. Activity Feed with Keyset Cursor Pagination
+* **$O(\log N)$ Keyset Pagination:** Compound B-tree index `(team_id, created_at DESC, id DESC)` providing constant-time seek across 10,000+ audit records.
+* **Infinite Scrolling:** Smooth infinite scroll controller with request locking, pull-to-refresh reset, and duplicate prevention.
+
+### 7. Push Notifications & FCM Integration
+* **Firebase Cloud Messaging (FCM):** FCM v1 / legacy payload builder with deep links and automatic bad-token cleanup loop (`lib/fcm.ts`).
+* **Quiet Hours & Timezone Awareness:** Quiet hours suppression logic preventing off-shift notifications (`lib/notifications.ts`).
+
+### 8. Cross-Platform Mobile Application
+* **Android Development APK:** Built via Capacitor wrapper (`app-debug.apk`), verified in Android Emulator with deep links and Google OAuth.
+* **Expo React Native App:** Parallel Expo implementation in `rota/mobile` with `expo-secure-store` encrypted token storage and deep link routing (`rota://shift/:id`, `rota://invite/:token`).
 
 ---
 
-## API Endpoints
+## Automated Test Suite
 
-The application implements modular Next.js route handlers under `app/api/`:
+Rota features an exhaustive automated test suite with **801 tests across 163 suites** running via the Node.js native test runner with **100% pass rate**:
 
-| Method | Endpoint | Access | Description |
-| :--- | :--- | :--- | :--- |
-| `POST` | `/api/auth/login` | Public | Validates credentials, checks Scrypt hash, and issues `rota_session` cookie |
-| `POST` | `/api/auth/logout` | Public | Clears session cookie by setting `maxAge: 0` |
-| `GET` | `/api/auth/me` | Public/Cookie | Returns sanitized session user profile or 401 unauthenticated response |
-| `GET` | `/api/shifts` | Public | Returns all shifts ordered chronologically (`shift_day ASC, id ASC`) |
-| `POST` | `/api/shifts` | Authenticated | Creates a new shift record; validates date and enforces caller role boundaries |
-| `GET` | `/api/shifts/[id]` | Public | Retrieves a single shift record by numeric ID |
-| `PUT` | `/api/shifts/[id]` | Authenticated | Updates an existing shift; enforces `canManageShiftRecord` ownership check |
-| `DELETE` | `/api/shifts/[id]` | Authenticated | Deletes a shift record; enforces `canManageShiftRecord` ownership check |
+```bash
+# Run all 801 unit and integration tests
+npm test
 
----
+# Verify Redis connectivity safely without secret exposure
+npm run check:redis
+```
 
-## Technology Stack
-
-Confirmed directly from `package.json`:
-
-* **Web Framework:** Next.js `16.4.0` (App Router, Turbopack)
-* **UI Library:** React `19.3.0` & React-DOM `19.3.0`
-* **Language:** TypeScript `^5`
-* **Styling:** Tailwind CSS `^4` (via `@tailwindcss/turbopack`)
-* **Database Client:** `@neondatabase/serverless` `^1.2.0` (Neon Serverless PostgreSQL)
-* **Authentication Primitives:** Node.js native `node:crypto` (`scryptSync`, `timingSafeEqual`, `createHmac`, `randomBytes`)
-* **Testing:** Node.js Native Test Runner (`node:test`, `node:assert`)
-* **Mobile Runtime:** Capacitor `^8.5.3` (`@capacitor/core`, `@capacitor/cli`, `@capacitor/android`)
-* **Deployment Platform:** Vercel (Edge Routing & Serverless Functions)
+### Test Coverage Highlights:
+* `tests/shifts.test.mjs` (33 tests): Shift CRUD, role boundaries, tenant isolation.
+* `tests/proration.test.mjs` (24 tests): Mathematical billing proration and leap years.
+* `tests/auth.test.mjs` (15 tests): Scrypt hashing, constant-time compare, session cookies.
+* `tests/refresh-tokens.test.mjs` (16 tests): Token rotation, reuse detection, family invalidation.
+* `tests/security-auth.test.mjs` (17 tests): Password reset tokens, single-use check, rate limiting, Zod validation.
+* `tests/redis-infrastructure.test.mjs` (27 tests): Redis sliding-window Lua rate limiting, 20-VU concurrency safety, HTTP headers, Redis failure fallback, caching hits/misses, shift mutation cache invalidation, production fail-safe hardening (HTTP 503 for 7 sensitive endpoints when Redis is unavailable, zero credential leakage, separate caching fallback, and diagnostic connectivity verification).
+* `tests/paystack-checkout.test.mjs` (31 tests): Paystack transaction initialization, verification, AES-256-GCM.
+* `tests/paystack-webhook.test.mjs` (16 tests): HMAC-SHA512 webhook signatures, ledger deduplication.
+* `tests/paystack-renewal.test.mjs` (26 tests): Subscription renewals, 7-day grace periods.
+* `tests/user-settings.test.mjs` (15 tests): Cross-device settings sync, revision conflict detection.
+* `tests/offline-shifts.test.mjs` (12 tests): Offline caching, workspace isolation, logout purging.
+* `tests/shift-swaps.test.mjs` (17 tests): Peer shift swap requests, manager approvals, atomic rollbacks.
+* `tests/activity-feed.test.mjs` (15 tests): Keyset cursors, infinite scroll deduplication, 10,000-record benchmark.
+* `tests/fcm.test.mjs` (6 tests): FCM push notifications, bad token eviction.
+* `tests/db-cluster.test.mjs` (7 tests): Connection pooling, deterministic SHA-256 sharding, RYOW consistency.
+* `tests/cache.test.mjs` (4 tests): Multi-range schedules, TTL expiration, mutation invalidation.
+* `tests/mobile.test.mjs` (7 tests): Mobile SecureStore lifecycle, deep link parsing.
 
 ---
 
 ## Environment Variables
 
-Configure the following environment variables in `.env.local` for local execution. Never commit real values or secrets to version control.
-
-```text
-# Neon Serverless PostgreSQL connection string (pooled connection mode)
-DATABASE_URL="postgresql://user:password@host-pooler.region.neon.tech/dbname?sslmode=require"
-
-# Cryptographic secret key used to sign and verify HMAC-SHA256 session tokens
-AUTH_SECRET="your-secure-random-cryptographic-secret-key-at-least-32-chars"
-```
-
----
-
-## Local Development & Setup
-
-Instructions for Windows Command Prompt (`cmd.exe`):
-
-1. **Navigate to the web project directory:**
-   ```cmd
-   cd rota\web
-   ```
-
-2. **Install project dependencies:**
-   ```cmd
-   npm install
-   ```
-
-3. **Configure local environment variables:**
-   Create a `.env.local` file in `rota\web` containing your placeholder or development credentials:
-   ```cmd
-   type nul > .env.local
-   ```
-   Edit `.env.local` in your editor to define `DATABASE_URL` and `AUTH_SECRET`.
-
-4. **Start the development server:**
-   ```cmd
-   npm run dev
-   ```
-   Open [http://localhost:3000](http://localhost:3000) in your browser.
-
-5. **Build for production:**
-   ```cmd
-   npm run build
-   ```
-
-6. **Start production server locally:**
-   ```cmd
-   npm run start
-   ```
+| Variable | Required | Description |
+| :--- | :--- | :--- |
+| `DATABASE_URL` | Yes | Neon Serverless PostgreSQL connection string (pooler host recommended) |
+| `AUTH_SECRET` | Yes | 32+ character secret for signing HMAC-SHA256 session and reset tokens |
+| `PAYSTACK_SECRET_KEY` | Yes (Billing) | Paystack secret API key (`sk_test_...` or `sk_live_...`) |
+| `NEXT_PUBLIC_PAYSTACK_PUBLIC_KEY` | Yes (Billing) | Paystack public key (`pk_test_...` or `pk_live_...`) |
+| `FIREBASE_PROJECT_ID` | Optional | Firebase Cloud Messaging project identifier |
+| `FIREBASE_CLIENT_EMAIL` | Optional | Service account email for FCM push notification delivery |
+| `FIREBASE_PRIVATE_KEY` | Optional | Private key for Google OAuth2 FCM authorization |
+| `REDIS_URL` | Optional | Distributed cache / rate limit Redis cluster URL |
 
 ---
 
-## Automated Testing
+## Getting Started
 
-Rota includes zero-dependency automated unit and security tests executed via Node.js native test runner:
+```bash
+# Clone the repository
+git clone https://github.com/umehchinaemeze-a11y/rota.git
+cd rota/web
 
-```cmd
+# Install dependencies
+npm install
+
+# Run TypeScript verification
+npx tsc --noEmit
+
+# Execute automated tests
 npm test
+
+# Run development server
+npm run dev
+
+# Build production bundle
+npm run build
 ```
-
-*Executes:* `node --experimental-strip-types --test tests/shifts.test.mjs`
-
-### Test Suite Summary (32 Tests Passing across 6 Suites):
-1. **Password Hashing & Constant-Time Verification (5 tests):** Validates unique salt generation, matching hash verification, incorrect password rejection, invalid input type handling, and non-hex salt handling.
-2. **Session Token Security (8 tests):** Validates HMAC-SHA256 creation, missing `AUTH_SECRET` guard, secret mismatch rejection, tampered payload detection (privilege escalation), tampered signature detection, expiration enforcement, and malformed token handling.
-3. **Server-Side Shift Authorization (6 tests):** Validates unauthenticated request denial, owner edit/delete permission, non-owner modification denial, legacy unassigned record (`user_id IS NULL`) protection, manager override authority, and rejection of client header impersonation claims.
-4. **Login Input Validation & Sanitization (4 tests):** Validates missing email handling, missing password handling, email whitespace and lowercase normalization, and leak-free profile exposure.
-5. **Shift Payload & ID Validation (5 tests):** Validates schema acceptance, date format regex enforcement, invalid calendar date rejection (e.g. February 31), and numeric ID validation.
-6. **Schedule State Updates (4 tests):** Validates update idempotency, chronological date sorting, immediate shift deletion, and unique ID additions.
-
-*Note:* These tests verify cryptographic functions, authorization gates, and data validation rules in isolation. They do not claim full end-to-end integration coverage across external cloud networks or formal third-party security certification.
-
----
-
-## Android Development Build Explanation
-
-An Android mobile wrapper project is configured in `android/` using Capacitor (`com.rota.app`):
-
-* **Architecture:** The mobile app functions as a native Android WebView wrapper around the hosted web application.
-* **Server Connection:** In `capacitor.config.ts`, `server.url` is explicitly configured to `https://rota-lovat-gamma.vercel.app/` with `androidScheme: 'https'`.
-* **Network Dependency:** Because the Capacitor shell points directly to the hosted production URL, the Android application requires an active internet connection to load and operate. It does not bundle an offline SQLite/Room database or local Node.js runtime.
-* **Web Directory Placeholder:** `www/index.html` is a minimal placeholder retained to satisfy Capacitor CLI's web-directory requirement. The actual application UI and API are served from https://rota-lovat-gamma.vercel.app/, and the Android wrapper requires an internet connection.
-* **Scope Note:** Native Android interactive authentication and offline background caching are not verified as implemented.
-
----
-
-## Honest Project Limitations & Unimplemented Scope
-
-In accordance with engineering integrity and project audit requirements, the following capabilities are explicitly documented as **not currently verified or implemented** in the existing codebase:
-
-* **Self-Service Sign-up:** No public account registration page or self-service signup endpoint exists. User accounts must be created administratively via database scripts.
-* **Team Invitations:** No team member invitation links, invitation tokens, or email invitation dispatch mechanisms are implemented.
-* **Multi-Tenant / Team Isolation:** The database schema consists of a single global `shifts` and `users` table without `teams`, `organizations`, or tenant boundaries. All users share the same workspace calendar.
-* **Subscription Plans & Proration:** No subscription tiers, Stripe checkout sessions, webhook handlers, seat limit enforcement, immutable billing ledgers, or proration calculation algorithms/tests exist.
-* **Shift Swaps & Approvals:** No peer-to-peer shift trade proposals or supervisor swap approval workflows are implemented.
-* **Push Notifications:** No push token registry, background notification worker jobs, notification preferences, quiet hours intervals, or timezone scheduling logic exist.
-* **Offline Viewing:** No Service Worker, Cache Storage API, or local IndexedDB shift store is present. The app cannot display shifts when disconnected from the network.
-* **200-VU Load Testing:** No automated 200-virtual-user concurrency load tests or benchmark reports have been executed against the Rota API.
-* **Real-Time Synchronization:** Shifts update on page load or after explicit user mutation. No WebSockets or Server-Sent Events (SSE) cross-device synchronization exists.

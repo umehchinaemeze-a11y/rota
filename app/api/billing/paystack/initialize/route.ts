@@ -240,9 +240,22 @@ export async function handlePaystackInitialize(
   }
 }
 
+import { enforceRateLimit } from "../../../../../lib/rate-limit.ts";
+
 export async function POST(req: Request) {
   try {
+    // Rate limiting: 10 initialize attempts per minute per IP
+    const { response: rateLimitResp } = await enforceRateLimit(req, {
+      action: "billing-initialize",
+      limit: 10,
+      windowSeconds: 60,
+    });
+    if (rateLimitResp) {
+      return rateLimitResp;
+    }
+
     const sessionUser = await getSessionUser({ revalidateWithDb: true });
+
     let body: any = {};
     try {
       body = await req.json();

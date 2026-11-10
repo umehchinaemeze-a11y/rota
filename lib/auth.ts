@@ -6,6 +6,7 @@ export type SessionPayload = {
   name: string;
   role: string;
   teamId?: number | null;
+  sessionId?: string;
   exp: number; // Unix timestamp in seconds
 };
 
@@ -89,6 +90,7 @@ export function createSessionToken(
     name: payload.name.trim(),
     role: payload.role.trim(),
     ...(payload.teamId !== undefined ? { teamId: payload.teamId } : {}),
+    ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
     exp: Math.floor(Date.now() / 1000) + ttlSeconds,
   };
 

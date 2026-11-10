@@ -1,9 +1,16 @@
 import { createSessionToken, verifyPassword } from "../../../../lib/auth.ts";
 import { getAuthSecret, serializeSessionCookie } from "../../../../lib/session.ts";
+import {
+  createAuthSession,
+  serializeRefreshCookie,
+  ACCESS_TOKEN_TTL_SECONDS,
+} from "../../../../lib/refresh-tokens.ts";
+import { enforceRateLimit } from "../../../../lib/rate-limit.ts";
 
 export type LoginRouteDependencies = {
   sql?: (strings: TemplateStringsArray, ...values: any[]) => Promise<any>;
   getSecret?: () => string;
+  skipRateLimit?: boolean;
 };
 
 let prodSqlPromise: Promise<any> | null = null;
@@ -20,6 +27,16 @@ export async function handleLogin(
   deps: LoginRouteDependencies = {}
 ): Promise<Response> {
   try {
+    if (!deps.skipRateLimit) {
+      const { response: rateLimitResp } = await enforceRateLimit(request, {
+        action: "login",
+        limit: 10,
+        windowSeconds: 60,
+      });
+      if (rateLimitResp) {
+        return rateLimitResp;
+      }
+    }
     let body: unknown;
     try {
       body = await request.json();
@@ -102,6 +119,16 @@ export async function handleLogin(
       );
     }
 
+    const userAgent = request.headers.get("user-agent") ?? undefined;
+    const ipAddress =
+      request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? undefined;
+
+    const authSession = await createAuthSession(sql, {
+      userId: user.id,
+      userAgent,
+      ipAddress,
+    });
+
     // Create session strictly with database-verified identity, ignoring any client role/ID claims
     const token = createSessionToken(
       {
@@ -109,11 +136,13 @@ export async function handleLogin(
         email: user.email,
         name: user.name,
         role: user.role,
+        sessionId: authSession.sessionId,
       },
-      secret
+      secret,
+      ACCESS_TOKEN_TTL_SECONDS
     );
 
-    return Response.json(
+    const response = Response.json(
       {
         id: user.id,
         email: user.email,
@@ -122,11 +151,19 @@ export async function handleLogin(
       },
       {
         status: 200,
-        headers: {
-          "Set-Cookie": serializeSessionCookie(token),
-        },
       }
     );
+
+    response.headers.append(
+      "Set-Cookie",
+      serializeSessionCookie(token, ACCESS_TOKEN_TTL_SECONDS, request)
+    );
+    response.headers.append(
+      "Set-Cookie",
+      serializeRefreshCookie(authSession.refreshToken, undefined, request)
+    );
+
+    return response;
   } catch (error) {
     console.error("Login processing error occurred.");
     return Response.json(

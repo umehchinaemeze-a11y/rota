@@ -10,12 +10,31 @@ import {
   type ApiShift,
   type ScheduleShift,
   type ShiftRecoveryOutcome,
+  type ShiftSwapRecord,
+  type NotificationRecord,
+  type UserNotificationPreferences,
+  type UserSettings,
+  type UserTheme,
+  SUPPORTED_THEMES,
+  SUPPORTED_LANGUAGES,
+  saveSettingsToOfflineCache,
+  loadSettingsFromOfflineCache,
+  saveShiftsToOfflineCache,
+  loadShiftsFromOfflineCache,
+  clearSettingsOfflineCache,
+  clearShiftsOfflineCache,
+  applyThemeToDocument,
+  applyLanguageToDocument,
 } from "@/lib/shifts-client";
 import type { RecoverableShift } from "@/lib/shift-recovery";
 import {
   resolveBillingVerificationBadge,
   type PaymentProvider,
 } from "@/lib/billing-provider-badge";
+import {
+  type ActivityEventRecord,
+  mergeActivityPages,
+} from "@/lib/activity-client";
 import GoogleAccountSettings from "./google-account-settings";
 
 type AuthUser = {
@@ -34,18 +53,6 @@ type UserWorkspace = {
   slug?: string;
   role: string;
   is_default?: boolean;
-};
-
-type ShiftSwapRequest = {
-  id: string;
-  shiftId: number;
-  shiftDay: string;
-  requesterName: string;
-  requesterRole: string;
-  targetEmployeeName: string;
-  reason: string;
-  status: "pending" | "approved" | "declined";
-  createdAt: string;
 };
 
 function getInitials(name: string) {
@@ -81,14 +88,26 @@ export default function Home() {
   const [deletingShift, setDeletingShift] = useState<ScheduleShift | null>(null);
 
   // Shift Swap states
-  const [swapRequests, setSwapRequests] = useState<ShiftSwapRequest[]>([]);
+  const [swapRequests, setSwapRequests] = useState<ShiftSwapRecord[]>([]);
   const [swappingShift, setSwappingShift] = useState<ScheduleShift | null>(null);
-  const [swapTarget, setSwapTarget] = useState("");
+  const [swapTargetShiftId, setSwapTargetShiftId] = useState<number | null>(null);
   const [swapReason, setSwapReason] = useState("");
   const [submittingSwap, setSubmittingSwap] = useState(false);
+  const [actioningSwapId, setActioningSwapId] = useState<number | null>(null);
 
-  // Workspace Settings & Team Invite states
+  // Notification states
   const [notificationsEnabled, setNotificationsEnabled] = useState(true);
+  const [userNotifications, setUserNotifications] = useState<NotificationRecord[]>([]);
+  const [unreadNotificationsCount, setUnreadNotificationsCount] = useState(0);
+  const [showNotificationsPanel, setShowNotificationsPanel] = useState(false);
+  const [notificationPreferences, setNotificationPreferences] = useState<UserNotificationPreferences | null>(null);
+  const [savingPreferences, setSavingPreferences] = useState(false);
+
+  // User Settings Synchronization states
+  const [userSettings, setUserSettings] = useState<UserSettings | null>(null);
+  const [savingSettings, setSavingSettings] = useState(false);
+  const [settingsConflict, setSettingsConflict] = useState<UserSettings | null>(null);
+
   const [showInviteModal, setShowInviteModal] = useState(false);
   const [inviteName, setInviteName] = useState("");
   const [inviteRole, setInviteRole] = useState("Front Desk");
@@ -109,6 +128,8 @@ export default function Home() {
     "loading" | "success" | "unauthenticated" | "forbidden" | "network_error"
   >("loading");
   const [statusMessage, setStatusMessage] = useState("");
+  const [isOfflineSchedule, setIsOfflineSchedule] = useState<boolean>(false);
+  const [offlineTimestamp, setOfflineTimestamp] = useState<string | null>(null);
 
   // Workspace onboarding states
   const [newWorkspaceName, setNewWorkspaceName] = useState("");
@@ -131,6 +152,17 @@ export default function Home() {
   const [subscriptionSeats, setSubscriptionSeats] = useState<number>(5);
   const [subscriptionStatus, setSubscriptionStatus] = useState<string>("active");
   const [paymentProvider, setPaymentProvider] = useState<PaymentProvider>(null);
+
+  // Activity Feed states
+  const [activityEvents, setActivityEvents] = useState<ActivityEventRecord[]>([]);
+  const [activityCursor, setActivityCursor] = useState<string | null>(null);
+  const [activityHasMore, setActivityHasMore] = useState(true);
+  const [activityLoading, setActivityLoading] = useState(false);
+  const [activityLoadingMore, setActivityLoadingMore] = useState(false);
+  const [activityRefreshing, setActivityRefreshing] = useState(false);
+  const [activityError, setActivityError] = useState<string | null>(null);
+  const activityFetchingRef = useRef(false);
+  const activitySentinelRef = useRef<HTMLDivElement | null>(null);
   const [autoRenewEnabled, setAutoRenewEnabled] = useState<boolean>(false);
   const [cancelAtPeriodEnd, setCancelAtPeriodEnd] = useState<boolean>(false);
   const [cardMetadata, setCardMetadata] = useState<{ brand?: string | null; last4?: string | null; bank?: string | null } | null>(null);
@@ -166,6 +198,25 @@ export default function Home() {
           return data.user as AuthUser;
         }
       }
+
+      // If access token expired (401), attempt silent token refresh
+      if (res.status === 401) {
+        try {
+          const refreshRes = await fetch("/api/auth/refresh", {
+            method: "POST",
+          });
+          if (refreshRes.ok) {
+            const refreshData = await refreshRes.json();
+            if (refreshData.success && refreshData.user) {
+              setCurrentUser(refreshData.user);
+              return refreshData.user as AuthUser;
+            }
+          }
+        } catch {
+          // Token refresh failed or revoked
+        }
+      }
+
       setCurrentUser(null);
       return null;
     } catch {
@@ -201,33 +252,171 @@ export default function Home() {
         setShiftLoadStatus("success");
         setStatusMessage("");
         setError("");
+        setIsOfflineSchedule(false);
+        setOfflineTimestamp(null);
+        if (currentUserRef.current) {
+          saveShiftsToOfflineCache(outcome.shifts, {
+            userId: currentUserRef.current.id,
+            email: currentUserRef.current.email,
+            teamId: currentUserRef.current.teamId,
+          });
+        }
       } else if (outcome.status === "unauthenticated") {
         setSchedule([]);
         setShiftLoadStatus("unauthenticated");
         setStatusMessage(outcome.message);
         setError(""); // Do not present 401 as a connection error
+        setIsOfflineSchedule(false);
+        setOfflineTimestamp(null);
       } else if (outcome.status === "forbidden") {
         setSchedule([]);
         setShiftLoadStatus("forbidden");
         setStatusMessage(outcome.message);
         setError(""); // Do not present 403 as a connection error
+        setIsOfflineSchedule(false);
+        setOfflineTimestamp(null);
       } else {
-        setSchedule([]);
-        setShiftLoadStatus("network_error");
-        setError(outcome.message);
-        setStatusMessage("");
+        const userCtx = currentUserRef.current
+          ? {
+              userId: currentUserRef.current.id,
+              email: currentUserRef.current.email,
+              teamId: currentUserRef.current.teamId,
+            }
+          : null;
+        const cached = loadShiftsFromOfflineCache(userCtx);
+        if (cached && cached.shifts && cached.shifts.length > 0) {
+          setSchedule(cached.shifts);
+          setShiftLoadStatus("success");
+          setIsOfflineSchedule(true);
+          setOfflineTimestamp(cached.timestamp);
+          setStatusMessage("");
+          setError("");
+        } else {
+          setSchedule([]);
+          setShiftLoadStatus("network_error");
+          setError(outcome.message);
+          setStatusMessage("");
+          setIsOfflineSchedule(false);
+          setOfflineTimestamp(null);
+        }
       }
     } catch {
-      const outcome = resolveShiftFetchResponse(0, null, true);
-      setSchedule([]);
-      setShiftLoadStatus("network_error");
-      setError(outcome.status !== "success" ? outcome.message : "Failed to load shifts.");
-      setStatusMessage("");
+      const userCtx = currentUserRef.current
+        ? {
+            userId: currentUserRef.current.id,
+            email: currentUserRef.current.email,
+            teamId: currentUserRef.current.teamId,
+          }
+        : null;
+      const cached = loadShiftsFromOfflineCache(userCtx);
+      if (cached && cached.shifts && cached.shifts.length > 0) {
+        setSchedule(cached.shifts);
+        setShiftLoadStatus("success");
+        setIsOfflineSchedule(true);
+        setOfflineTimestamp(cached.timestamp);
+        setStatusMessage("");
+        setError("");
+      } else {
+        const outcome = resolveShiftFetchResponse(0, null, true);
+        setSchedule([]);
+        setShiftLoadStatus("network_error");
+        setError(outcome.status !== "success" ? outcome.message : "Failed to load shifts.");
+        setStatusMessage("");
+        setIsOfflineSchedule(false);
+        setOfflineTimestamp(null);
+      }
     } finally {
       clearTimeout(timeoutId);
       setLoading(false);
     }
   }, []);
+
+  const loadSwapRequests = useCallback(async () => {
+    try {
+      const res = await fetch("/api/shifts/swaps");
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data)) {
+          setSwapRequests(data);
+        }
+      }
+    } catch {
+      // Swaps loading error should not break dashboard
+    }
+  }, []);
+
+  const loadNotifications = useCallback(async () => {
+    try {
+      const res = await fetch("/api/notifications");
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.notifications)) {
+          setUserNotifications(data.notifications);
+          setUnreadNotificationsCount(data.unreadCount || 0);
+        }
+      }
+    } catch {
+      // Background notifications error
+    }
+  }, []);
+
+  const loadUserSettings = useCallback(async (user?: AuthUser | null) => {
+    const targetUser = user !== undefined ? user : currentUserRef.current;
+    if (!targetUser || !targetUser.id) return;
+
+    const userContext = {
+      userId: targetUser.id,
+      email: targetUser.email,
+      teamId: targetUser.teamId,
+    };
+
+    // 1. Instant local offline cache lookup
+    const cached = loadSettingsFromOfflineCache(userContext);
+    if (cached) {
+      setUserSettings(cached);
+      applyThemeToDocument(cached.theme);
+      applyLanguageToDocument(cached.language);
+      setNotificationsEnabled(cached.notifications.enabled);
+      setNotificationPreferences({
+        userId: cached.userId,
+        teamId: cached.teamId,
+        enabled: cached.notifications.enabled,
+        categories: cached.notifications.categories,
+        quietHours: cached.quietHours,
+        updatedAt: cached.updatedAt,
+      });
+    }
+
+    // 2. Authoritative server query
+    try {
+      const res = await fetch("/api/settings");
+      if (res.ok) {
+        const data = await res.json();
+        if (data.settings) {
+          setUserSettings(data.settings);
+          saveSettingsToOfflineCache(data.settings, userContext);
+          applyThemeToDocument(data.settings.theme);
+          applyLanguageToDocument(data.settings.language);
+          setNotificationsEnabled(data.settings.notifications.enabled);
+          setNotificationPreferences({
+            userId: data.settings.userId,
+            teamId: data.settings.teamId,
+            enabled: data.settings.notifications.enabled,
+            categories: data.settings.notifications.categories,
+            quietHours: data.settings.quietHours,
+            updatedAt: data.settings.updatedAt,
+          });
+          setSettingsConflict(null);
+        }
+      }
+    } catch {
+      // Offline fallback: cached settings remain active
+    }
+  }, []);
+
+  const loadNotificationPreferences = useCallback(async (user?: AuthUser | null) => {
+    await loadUserSettings(user);
+  }, [loadUserSettings]);
 
   // Check legacy shifts available for recovery
   const checkRecoverableShifts = useCallback(
@@ -429,6 +618,97 @@ export default function Home() {
     }
   };
 
+  const loadActivityFirstPage = useCallback(async (isRefresh = false) => {
+    if (activityFetchingRef.current) return;
+    activityFetchingRef.current = true;
+
+    if (isRefresh) {
+      setActivityRefreshing(true);
+    } else {
+      setActivityLoading(true);
+    }
+    setActivityError(null);
+
+    try {
+      const res = await fetch("/api/activity?limit=20");
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      setActivityEvents(data.items || []);
+      setActivityCursor(data.nextCursor || null);
+      setActivityHasMore(Boolean(data.hasMore));
+    } catch (err: any) {
+      setActivityError(err.message || "Failed to load activity feed.");
+    } finally {
+      activityFetchingRef.current = false;
+      setActivityLoading(false);
+      setActivityRefreshing(false);
+    }
+  }, []);
+
+  const loadActivityNextPage = useCallback(async () => {
+    if (
+      activityFetchingRef.current ||
+      !activityHasMore ||
+      !activityCursor ||
+      activityLoading ||
+      activityLoadingMore ||
+      activityRefreshing
+    ) {
+      return;
+    }
+    activityFetchingRef.current = true;
+    setActivityLoadingMore(true);
+    setActivityError(null);
+
+    try {
+      const res = await fetch(`/api/activity?limit=20&cursor=${encodeURIComponent(activityCursor)}`);
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      setActivityEvents((prev) => mergeActivityPages(prev, data.items || []));
+      setActivityCursor(data.nextCursor || null);
+      setActivityHasMore(Boolean(data.hasMore));
+    } catch (err: any) {
+      setActivityError(err.message || "Failed to load older activities.");
+    } finally {
+      activityFetchingRef.current = false;
+      setActivityLoadingMore(false);
+    }
+  }, [activityCursor, activityHasMore, activityLoading, activityLoadingMore, activityRefreshing]);
+
+  // Load first page when Activity tab becomes active
+  useEffect(() => {
+    if (activeTab === "Activity" && activityEvents.length === 0 && !activityLoading) {
+      loadActivityFirstPage(false);
+    }
+  }, [activeTab, activityEvents.length, activityLoading, loadActivityFirstPage]);
+
+  // IntersectionObserver for infinite scrolling sentinel
+  useEffect(() => {
+    if (activeTab !== "Activity" || !activityHasMore || activityLoadingMore || activityLoading) {
+      return;
+    }
+    const sentinel = activitySentinelRef.current;
+    if (!sentinel) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting) {
+          loadActivityNextPage();
+        }
+      },
+      { threshold: 0.1 }
+    );
+
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [activeTab, activityHasMore, activityLoadingMore, activityLoading, loadActivityNextPage]);
+
   // Load shifts and verify authentication on load
   useEffect(() => {
     let active = true;
@@ -446,12 +726,19 @@ export default function Home() {
           await Promise.allSettled([
             checkRecoverableShifts(user),
             loadBillingStatus(user),
+            loadSwapRequests(),
+            loadNotifications(),
+            loadUserSettings(user),
           ]);
           if (!active) return;
 
-          // Check if returning from checkout with reference (Paystack)
+          // Check if returning from checkout with reference (Paystack) or deep link
           if (typeof window !== "undefined") {
             const params = new URLSearchParams(window.location.search);
+            const tabParam = params.get("tab");
+            if (tabParam && ["Overview", "Schedule", "Activity", "Team", "Settings"].includes(tabParam)) {
+              setActiveTab(tabParam);
+            }
             const pstkRef = params.get("reference") || params.get("trxref");
             const pstkStatus = params.get("status");
             const googleStatus = params.get("google");
@@ -493,6 +780,11 @@ export default function Home() {
           setSubscriptionStatus("active");
           setPaymentProvider(null);
           setRecoverableShifts([]);
+          setUserSettings(null);
+          setSettingsConflict(null);
+          clearSettingsOfflineCache();
+          applyThemeToDocument("system");
+          applyLanguageToDocument("en");
         }
       } catch {
         if (active) {
@@ -511,7 +803,7 @@ export default function Home() {
     return () => {
       active = false;
     };
-  }, [checkSession, loadShifts, checkRecoverableShifts, loadBillingStatus]);
+  }, [checkSession, loadShifts, checkRecoverableShifts, loadBillingStatus, loadSwapRequests, loadNotifications, loadUserSettings]);
 
   async function handleLogin(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -541,6 +833,9 @@ export default function Home() {
       await loadShifts();
       await checkRecoverableShifts(data);
       await loadBillingStatus(data);
+      await loadSwapRequests();
+      await loadNotifications();
+      await loadUserSettings(data);
     } catch (err) {
       setLoginError(err instanceof Error ? err.message : "Unable to sign in.");
     } finally {
@@ -585,6 +880,9 @@ export default function Home() {
       if (user) {
         await checkRecoverableShifts(user);
         await loadBillingStatus(user);
+        await loadSwapRequests();
+        await loadNotifications();
+        await loadUserSettings(user);
       }
     } catch (err: unknown) {
       setWorkspaceError(
@@ -595,14 +893,32 @@ export default function Home() {
     }
   }
 
-  async function handleLogout() {
+  async function handleLogout(allDevices = false) {
     try {
-      await fetch("/api/auth/logout", { method: "POST" });
+      await fetch(allDevices ? "/api/auth/logout?all=true" : "/api/auth/logout", {
+        method: "POST",
+      });
       setCurrentUser(null);
+      setSwapRequests([]);
+      setUserNotifications([]);
+      setUnreadNotificationsCount(0);
+      setNotificationPreferences(null);
+      setUserSettings(null);
+      setSettingsConflict(null);
+      clearSettingsOfflineCache();
+      clearShiftsOfflineCache();
+      setIsOfflineSchedule(false);
+      setOfflineTimestamp(null);
+      applyThemeToDocument("system");
+      applyLanguageToDocument("en");
       setRecoverableShifts([]);
       setSubscriptionPlan("free");
       setSubscriptionSeats(5);
-      setNotice("You have signed out successfully.");
+      setNotice(
+        allDevices
+          ? "You have been signed out from all devices."
+          : "You have signed out successfully."
+      );
       await loadShifts();
     } catch {
       setError("Failed to sign out cleanly.");
@@ -836,119 +1152,340 @@ export default function Home() {
       return;
     }
 
+    const isManager = isManagerRole(currentUser?.role);
+    if (!isManager && shift.userId !== currentUser?.id) {
+      setError(
+        `Permission denied: You are signed in as "${currentUser.name}". You can only request swaps for shifts assigned to your account.`
+      );
+      return;
+    }
+
     setSwappingShift(shift);
-    const candidate = team.find((m) => m.name !== shift.name);
-    setSwapTarget(candidate ? candidate.name : "");
+
+    // Find candidate shifts assigned to other team members in this workspace
+    const candidates = schedule.filter(
+      (s) =>
+        s.id !== shift.id &&
+        (shift.userId ? s.userId !== shift.userId : s.name !== shift.name)
+    );
+    setSwapTargetShiftId(candidates.length > 0 ? candidates[0].id : null);
     setSwapReason("");
   }
 
   async function handleConfirmSwap(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    if (!swappingShift || !swapTarget || submittingSwap) return;
+    if (!swappingShift || !swapTargetShiftId || submittingSwap) return;
     setSubmittingSwap(true);
+    setError("");
 
-    const isManager = isManagerRole(currentUser?.role);
-
-    if (isManager) {
-      try {
-        const targetMember = team.find((m) => m.name === swapTarget);
-        const response = await fetch(`/api/shifts/${swappingShift.id}`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            employeeName: swapTarget,
-            role: targetMember ? targetMember.role : swappingShift.role,
-            shiftDay: swappingShift.shiftDay,
-          }),
-        });
-
-        const updated = await response.json();
-        if (!response.ok) {
-          throw new Error(updated.error || "Failed to execute shift swap.");
-        }
-
-        const mapped = mapApiShift(
-          updated,
-          schedule.findIndex((s) => s.id === swappingShift.id)
-        );
-        setSchedule((curr) =>
-          curr.map((s) => (s.id === mapped.id ? mapped : s))
-        );
-        setNotice(
-          `Shift swap approved and executed: Shift on ${swappingShift.shiftDay} assigned to ${swapTarget}.`
-        );
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Swap execution failed.");
-      }
-    } else {
-      const newRequest: ShiftSwapRequest = {
-        id: `swap-${Date.now()}`,
-        shiftId: swappingShift.id,
-        shiftDay: swappingShift.shiftDay,
-        requesterName: swappingShift.name,
-        requesterRole: swappingShift.role,
-        targetEmployeeName: swapTarget,
-        reason: swapReason.trim() || "Coverage requested",
-        status: "pending",
-        createdAt: new Date().toLocaleTimeString([], {
-          hour: "2-digit",
-          minute: "2-digit",
-        }),
-      };
-      setSwapRequests((curr) => [newRequest, ...curr]);
-      setNotice(
-        `Swap request submitted for ${swappingShift.name} to swap with ${swapTarget}. Awaiting manager approval.`
-      );
-    }
-
-    setSwappingShift(null);
-    setSubmittingSwap(false);
-  }
-
-  async function handleApproveSwap(req: ShiftSwapRequest) {
     try {
-      const shift = schedule.find((s) => s.id === req.shiftId);
-      if (!shift) throw new Error("Shift record no longer found.");
-
-      const targetMember = team.find((m) => m.name === req.targetEmployeeName);
-      const response = await fetch(`/api/shifts/${req.shiftId}`, {
-        method: "PUT",
+      const response = await fetch("/api/shifts/swaps", {
+        method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          employeeName: req.targetEmployeeName,
-          role: targetMember ? targetMember.role : req.requesterRole,
-          shiftDay: req.shiftDay,
+          sourceShiftId: swappingShift.id,
+          targetShiftId: swapTargetShiftId,
+          reason: swapReason.trim() || undefined,
         }),
       });
 
-      const updated = await response.json();
+      const data = await response.json();
       if (!response.ok) {
-        throw new Error(updated.error || "Failed to approve swap.");
+        throw new Error(data.error || "Failed to submit shift swap request.");
       }
 
-      const mapped = mapApiShift(
-        updated,
-        schedule.findIndex((s) => s.id === req.shiftId)
-      );
-      setSchedule((curr) =>
-        curr.map((s) => (s.id === mapped.id ? mapped : s))
-      );
-      setSwapRequests((curr) =>
-        curr.map((r) => (r.id === req.id ? { ...r, status: "approved" } : r))
-      );
       setNotice(
-        `Approved shift swap: ${req.requesterName} → ${req.targetEmployeeName} on ${req.shiftDay}.`
+        "Shift swap request submitted successfully! Awaiting manager approval."
       );
+      setSwappingShift(null);
+      setSwapTargetShiftId(null);
+      setSwapReason("");
+      await loadSwapRequests();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not approve swap.");
+      setError(err instanceof Error ? err.message : "Swap request submission failed.");
+    } finally {
+      setSubmittingSwap(false);
     }
   }
 
-  function handleDeclineSwap(reqId: string) {
-    setSwapRequests((curr) =>
-      curr.map((r) => (r.id === reqId ? { ...r, status: "declined" } : r))
+  async function handleApproveSwap(swapId: number) {
+    if (actioningSwapId !== null) return;
+    setActioningSwapId(swapId);
+    setError("");
+
+    // Optimistic Update: snapshot previous state for rollback
+    const previousSchedule = [...schedule];
+    const previousSwapRequests = [...swapRequests];
+
+    const targetSwap = swapRequests.find((r) => r.id === swapId);
+    if (targetSwap) {
+      setSwapRequests((prev) =>
+        prev.map((r) => (r.id === swapId ? { ...r, status: "approved" as const } : r))
+      );
+
+      if (targetSwap.source_shift_id && targetSwap.target_shift_id) {
+        const sIdx = schedule.findIndex((s) => s.id === targetSwap.source_shift_id);
+        const tIdx = schedule.findIndex((s) => s.id === targetSwap.target_shift_id);
+        if (sIdx !== -1 && tIdx !== -1) {
+          const updated = [...schedule];
+          const tempUser = { name: updated[sIdx].name, role: updated[sIdx].role, userId: updated[sIdx].userId };
+          updated[sIdx] = {
+            ...updated[sIdx],
+            name: updated[tIdx].name,
+            role: updated[tIdx].role,
+            userId: updated[tIdx].userId,
+          };
+          updated[tIdx] = {
+            ...updated[tIdx],
+            name: tempUser.name,
+            role: tempUser.role,
+            userId: tempUser.userId,
+          };
+          setSchedule(updated);
+        }
+      }
+    }
+
+    try {
+      const response = await fetch(`/api/shifts/swaps/${swapId}/approve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ notes: "Approved by manager" }),
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to approve shift swap.");
+      }
+
+      setNotice("Shift swap approved! Both shifts have been updated atomically.");
+      await loadShifts();
+      await loadSwapRequests();
+    } catch (err) {
+      // Rollback to prior snapshot
+      setSchedule(previousSchedule);
+      setSwapRequests(previousSwapRequests);
+      setError(err instanceof Error ? err.message : "Could not approve shift swap. Changes reverted.");
+    } finally {
+      setActioningSwapId(null);
+    }
+  }
+
+  async function handleRejectSwap(swapId: number, isCancel = false) {
+    if (actioningSwapId !== null) return;
+    setActioningSwapId(swapId);
+    setError("");
+
+    // Optimistic Update: snapshot previous state for rollback
+    const previousSwapRequests = [...swapRequests];
+    setSwapRequests((prev) =>
+      prev.map((r) =>
+        r.id === swapId
+          ? { ...r, status: isCancel ? ("cancelled" as const) : ("rejected" as const) }
+          : r
+      )
     );
-    setNotice("Shift swap request was declined.");
+
+    try {
+      const response = await fetch(`/api/shifts/swaps/${swapId}/reject`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          notes: isCancel ? "Cancelled by employee" : "Declined by manager",
+        }),
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(
+          data.error ||
+            (isCancel ? "Failed to cancel swap request." : "Failed to decline swap request.")
+        );
+      }
+
+      setNotice(isCancel ? "Shift swap request cancelled." : "Shift swap request declined.");
+      await loadSwapRequests();
+    } catch (err) {
+      // Rollback on failure
+      setSwapRequests(previousSwapRequests);
+      setError(err instanceof Error ? err.message : "Action failed. Reverted changes.");
+    } finally {
+      setActioningSwapId(null);
+    }
+  }
+
+  async function handleSaveUserSettings(
+    overrideSettings?: Partial<UserSettings>,
+    force = false
+  ) {
+    if (!userSettings || savingSettings) return;
+    setSavingSettings(true);
+    setError("");
+
+    // Optimistic Update: snapshot previous settings for rollback
+    const previousSettings = { ...userSettings };
+    const optimistic = {
+      ...userSettings,
+      ...(overrideSettings || {}),
+    };
+    setUserSettings(optimistic as UserSettings);
+    if (optimistic.theme) applyThemeToDocument(optimistic.theme);
+    if (optimistic.language) applyLanguageToDocument(optimistic.language);
+
+    const payload = {
+      ...optimistic,
+      expectedRevision: userSettings.revision,
+      force,
+    };
+
+    try {
+      const res = await fetch("/api/settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      const data = await res.json();
+
+      if (res.status === 409 && data.conflict) {
+        // Rollback
+        setUserSettings(previousSettings);
+        applyThemeToDocument(previousSettings.theme);
+        applyLanguageToDocument(previousSettings.language);
+        setSettingsConflict(data.serverSettings);
+        setError("Settings conflict detected: Another device updated your settings.");
+        return;
+      }
+
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to save settings.");
+      }
+
+      const saved = data.settings;
+      setUserSettings(saved);
+      setSettingsConflict(null);
+      if (currentUserRef.current) {
+        saveSettingsToOfflineCache(saved, {
+          userId: currentUserRef.current.id,
+          email: currentUserRef.current.email,
+          teamId: currentUserRef.current.teamId,
+        });
+      }
+      applyThemeToDocument(saved.theme);
+      applyLanguageToDocument(saved.language);
+      setNotificationsEnabled(saved.notifications.enabled);
+      setNotificationPreferences({
+        userId: saved.userId,
+        teamId: saved.teamId,
+        enabled: saved.notifications.enabled,
+        categories: saved.notifications.categories,
+        quietHours: saved.quietHours,
+        updatedAt: saved.updatedAt,
+      });
+      setNotice(`Settings synchronized across your devices (Revision #${saved.revision}).`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to update settings.");
+    } finally {
+      setSavingSettings(false);
+    }
+  }
+
+  async function handleReloadServerSettings() {
+    if (settingsConflict) {
+      setUserSettings(settingsConflict);
+      if (currentUserRef.current) {
+        saveSettingsToOfflineCache(settingsConflict, {
+          userId: currentUserRef.current.id,
+          email: currentUserRef.current.email,
+          teamId: currentUserRef.current.teamId,
+        });
+      }
+      applyThemeToDocument(settingsConflict.theme);
+      applyLanguageToDocument(settingsConflict.language);
+      setNotificationsEnabled(settingsConflict.notifications.enabled);
+      setNotificationPreferences({
+        userId: settingsConflict.userId,
+        teamId: settingsConflict.teamId,
+        enabled: settingsConflict.notifications.enabled,
+        categories: settingsConflict.notifications.categories,
+        quietHours: settingsConflict.quietHours,
+        updatedAt: settingsConflict.updatedAt,
+      });
+      setSettingsConflict(null);
+      setNotice(`Reloaded latest settings from server (Revision #${settingsConflict.revision}).`);
+    } else {
+      await loadUserSettings();
+    }
+  }
+
+  async function handleOverwriteServerSettings() {
+    if (!userSettings) return;
+    await handleSaveUserSettings(userSettings, true);
+  }
+
+  async function handleSaveNotificationPreferences() {
+    if (userSettings) {
+      await handleSaveUserSettings();
+      return;
+    }
+
+    if (!notificationPreferences || savingPreferences) return;
+    setSavingPreferences(true);
+    setError("");
+
+    try {
+      const res = await fetch("/api/notifications/preferences", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(notificationPreferences),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to save preferences.");
+      }
+
+      setNotice("Notification preferences and quiet hours saved.");
+      setNotificationPreferences(data.preferences);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to update notification preferences.");
+    } finally {
+      setSavingPreferences(false);
+    }
+  }
+
+  async function handleNotificationClick(notif: NotificationRecord) {
+    setShowNotificationsPanel(false);
+    try {
+      await fetch("/api/notifications", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: notif.id }),
+      });
+      setUserNotifications((curr) =>
+        curr.map((n) => (n.id === notif.id ? { ...n, read: true } : n))
+      );
+      setUnreadNotificationsCount((prev) => Math.max(0, prev - 1));
+    } catch {
+      // Ignore
+    }
+
+    if (notif.deepLink) {
+      if (typeof window !== "undefined") {
+        window.location.href = notif.deepLink;
+      }
+    }
+  }
+
+  async function handleMarkAllNotificationsRead() {
+    try {
+      await fetch("/api/notifications", { method: "POST" });
+      setUserNotifications((curr) => curr.map((n) => ({ ...n, read: true })));
+      setUnreadNotificationsCount(0);
+      setNotice("All notifications marked as read.");
+    } catch {
+      setError("Failed to mark notifications read.");
+    }
   }
 
   function handleInviteMember(e: React.FormEvent<HTMLFormElement>) {
@@ -1109,76 +1646,162 @@ export default function Home() {
   return (
     <main className="min-h-screen bg-[#f7f8f5] text-slate-900">
       <div className="mx-auto flex min-h-screen max-w-[1440px]">
-        {/* Sidebar */}
+        {/* Desktop Sidebar */}
         <aside className="hidden w-64 shrink-0 flex-col border-r border-slate-200 bg-white p-6 md:flex">
-          <div className="mb-12 flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-lime-300 text-xl font-black">
+          <div className="mb-10 flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-lime-300 text-xl font-black text-slate-950 shadow-2xs">
               R
             </div>
             <div>
-              <p className="text-xl font-bold tracking-tight">
+              <p className="text-xl font-bold tracking-tight text-slate-950">
                 rota<span className="text-lime-600">.</span>
               </p>
-              <p className="text-xs text-slate-500">TEAM SCHEDULING</p>
+              <p className="text-[11px] font-semibold tracking-wider text-slate-400">TEAM SCHEDULING</p>
             </div>
           </div>
 
           <p className="mb-3 text-xs font-semibold uppercase tracking-widest text-slate-400">
             Workspace
           </p>
-          <nav className="space-y-2">
-            {["Overview", "Schedule", "Team", "Settings"].map((tab) => (
+          <nav className="space-y-1.5">
+            {[
+              { name: "Overview", icon: "◫" },
+              { name: "Schedule", icon: "▦" },
+              { name: "Activity", icon: "📋" },
+              { name: "Team", icon: "♙" },
+              { name: "Settings", icon: "⚙" },
+            ].map((tab) => (
               <button
-                key={tab}
+                key={tab.name}
                 onClick={() => {
-                  setActiveTab(tab);
+                  setActiveTab(tab.name);
                   setError("");
                   setNotice("");
                 }}
-                className={`w-full rounded-xl px-4 py-3 text-left text-sm font-medium transition ${
-                  activeTab === tab
-                    ? "bg-lime-200 text-slate-950 font-bold"
+                className={`w-full rounded-xl px-4 py-3 text-left text-sm font-medium transition flex items-center justify-between ${
+                  activeTab === tab.name
+                    ? "bg-lime-200 text-slate-950 font-bold shadow-2xs"
                     : "text-slate-600 hover:bg-slate-100"
                 }`}
               >
-                {tab === "Overview"
-                  ? "◫"
-                  : tab === "Schedule"
-                  ? "▦"
-                  : tab === "Team"
-                  ? "♙"
-                  : "⚙"}{" "}
-                <span className="ml-3">{tab}</span>
+                <span className="flex items-center gap-3">
+                  <span className="text-base select-none">{tab.icon}</span>
+                  <span>{tab.name}</span>
+                </span>
+                {tab.name === "Schedule" && schedule.length > 0 && (
+                  <span className="rounded-full bg-slate-900/10 px-2 py-0.5 text-[10px] font-bold text-slate-700">
+                    {schedule.length}
+                  </span>
+                )}
+                {tab.name === "Team" && team.length > 0 && (
+                  <span className="rounded-full bg-slate-900/10 px-2 py-0.5 text-[10px] font-bold text-slate-700">
+                    {team.length}
+                  </span>
+                )}
               </button>
             ))}
           </nav>
 
-          <div className="mt-auto rounded-2xl bg-slate-900 p-4 text-white">
-            <p className="text-sm font-semibold">Verified Authentication</p>
-            <p className="mt-2 text-xs leading-5 text-slate-300">
-              Session verified strictly from HttpOnly cookies and database roles.
+          <div className="mt-auto rounded-2xl bg-slate-900 p-4 text-white shadow-sm">
+            <p className="text-sm font-semibold">A better way to plan.</p>
+            <p className="mt-1.5 text-xs leading-5 text-slate-300">
+              Keep shifts clear, teams aligned, and every week organized.
             </p>
-            <div className="mt-4 flex items-center gap-2">
-              <span
-                className={`h-2 w-2 rounded-full ${
-                  currentUser ? "bg-lime-400 animate-pulse" : "bg-amber-400"
+            <div className="mt-3.5 h-1.5 rounded-full bg-slate-800">
+              <div
+                className={`h-1.5 rounded-full transition-all duration-500 ${
+                  currentUser ? "w-full bg-lime-300" : "w-1/3 bg-amber-400"
                 }`}
               />
-              <span className="text-xs text-slate-300">
-                {currentUser
-                  ? `Signed in as ${currentUser.name}`
-                  : "Signed out (read-only)"}
+            </div>
+            <div className="mt-2.5 flex items-center justify-between">
+              <div className="flex items-center gap-1.5">
+                <span
+                  className={`h-2 w-2 rounded-full ${
+                    currentUser ? "bg-lime-400 animate-pulse" : "bg-amber-400"
+                  }`}
+                />
+                <span className="text-[11px] text-slate-300 truncate max-w-[120px]">
+                  {currentUser ? currentUser.name : "Signed out"}
+                </span>
+              </div>
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                {currentUser ? currentUser.role : "Read-only"}
               </span>
             </div>
           </div>
         </aside>
 
         {/* Main Content Area */}
-        <section className="min-w-0 flex-1">
+        <section className="min-w-0 flex-1 flex flex-col">
+          {/* Mobile Top Brand Bar */}
+          <div className="flex items-center justify-between border-b border-slate-200 bg-white px-5 py-3 md:hidden">
+            <div className="flex items-center gap-2.5">
+              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-lime-300 text-base font-black text-slate-950 shadow-2xs">
+                R
+              </div>
+              <span className="text-lg font-bold tracking-tight text-slate-950">
+                rota<span className="text-lime-600">.</span>
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              {currentUser ? (
+                <div className="flex items-center gap-2">
+                  <div className="flex h-7 w-7 items-center justify-center rounded-full bg-slate-900 text-xs font-bold text-white">
+                    {getInitials(currentUser.name)}
+                  </div>
+                  <button
+                    onClick={() => handleLogout(false)}
+                    className="rounded-lg border border-slate-300 bg-white px-2 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-100"
+                  >
+                    Sign out
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => setShowLoginModal(true)}
+                  className="rounded-lg border border-slate-300 bg-white px-2.5 py-1 text-xs font-bold text-slate-800"
+                >
+                  Sign in
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Mobile Tab Navigation Strip */}
+          <div className="flex overflow-x-auto border-b border-slate-200 bg-white px-4 py-2 md:hidden gap-1.5">
+            {[
+              { name: "Overview", icon: "◫" },
+              { name: "Schedule", icon: "▦" },
+              { name: "Activity", icon: "📋" },
+              { name: "Team", icon: "♙" },
+              { name: "Settings", icon: "⚙" },
+            ].map((tab) => (
+              <button
+                key={tab.name}
+                onClick={() => {
+                  setActiveTab(tab.name);
+                  setError("");
+                  setNotice("");
+                }}
+                className={`shrink-0 rounded-xl px-3.5 py-2 text-xs font-medium transition flex items-center gap-1.5 ${
+                  activeTab === tab.name
+                    ? "bg-lime-200 text-slate-950 font-bold shadow-2xs"
+                    : "text-slate-600 hover:bg-slate-100"
+                }`}
+              >
+                <span>{tab.icon}</span>
+                <span>{tab.name}</span>
+              </button>
+            ))}
+          </div>
+
           <header className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-200 bg-white px-5 py-5 sm:px-8">
             <div>
-              <p className="text-xs font-medium text-slate-500">WORKSPACE / ROTA</p>
-              <h1 className="mt-1 text-xl font-bold sm:text-2xl">{activeTab}</h1>
+              <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">
+                WORKSPACE / ROTA
+              </p>
+              <h1 className="mt-1 text-xl font-bold sm:text-2xl text-slate-900">{activeTab}</h1>
             </div>
 
             <div className="flex flex-wrap items-center gap-3">
@@ -1199,7 +1822,7 @@ export default function Home() {
                     </p>
                   </div>
                   <button
-                    onClick={handleLogout}
+                    onClick={() => handleLogout(false)}
                     className="ml-2 rounded-lg border border-slate-300 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-100"
                   >
                     Sign out
@@ -1212,6 +1835,87 @@ export default function Home() {
                 >
                   🔐 Sign in
                 </button>
+              )}
+
+              {currentUser && (
+                <div className="relative">
+                  <button
+                    type="button"
+                    onClick={() => setShowNotificationsPanel(!showNotificationsPanel)}
+                    className="relative flex h-9 w-9 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 transition shadow-xs"
+                    aria-label="View notifications"
+                  >
+                    <span className="text-base select-none">🔔</span>
+                    {unreadNotificationsCount > 0 && (
+                      <span className="absolute -top-1 -right-1 flex h-4 w-4 items-center justify-center rounded-full bg-rose-600 text-[9px] font-bold text-white animate-pulse">
+                        {unreadNotificationsCount > 9 ? "9+" : unreadNotificationsCount}
+                      </span>
+                    )}
+                  </button>
+
+                  {/* Notifications Popover Dropdown */}
+                  {showNotificationsPanel && (
+                    <div className="absolute right-0 mt-2 w-80 sm:w-96 rounded-2xl border border-slate-200 bg-white p-4 shadow-xl z-50">
+                      <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold text-sm text-slate-900">Notifications</span>
+                          {unreadNotificationsCount > 0 && (
+                            <span className="rounded-full bg-lime-100 px-2 py-0.5 text-[10px] font-bold text-lime-800">
+                              {unreadNotificationsCount} new
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          {unreadNotificationsCount > 0 && (
+                            <button
+                              type="button"
+                              onClick={handleMarkAllNotificationsRead}
+                              className="text-[11px] text-slate-500 hover:text-slate-900 underline"
+                            >
+                              Mark read
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => setShowNotificationsPanel(false)}
+                            className="rounded-md p-1 text-slate-400 hover:bg-slate-100"
+                            aria-label="Close"
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="mt-2 max-h-72 overflow-y-auto space-y-2">
+                        {userNotifications.length > 0 ? (
+                          userNotifications.map((n) => (
+                            <div
+                              key={n.id}
+                              onClick={() => handleNotificationClick(n)}
+                              className={`cursor-pointer rounded-xl p-3 text-xs transition border ${
+                                n.read
+                                  ? "border-slate-100 bg-white hover:bg-slate-50"
+                                  : "border-lime-200 bg-lime-50/70 hover:bg-lime-50"
+                              }`}
+                            >
+                              <div className="flex items-start justify-between gap-2">
+                                <p className="font-bold text-slate-900">{n.title}</p>
+                                <span className="text-[10px] text-slate-400 shrink-0">
+                                  {n.createdAt ? new Date(n.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ""}
+                                </span>
+                              </div>
+                              <p className="mt-1 text-slate-600">{n.body}</p>
+                            </div>
+                          ))
+                        ) : (
+                          <p className="py-6 text-center text-xs text-slate-400">
+                            No notifications yet for this workspace.
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
               )}
 
               <button
@@ -1290,40 +1994,43 @@ export default function Home() {
 
             {/* Overview Stats */}
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-              <div className="rounded-2xl border border-slate-200 bg-white p-5">
+              <article className="rounded-2xl border border-slate-200 bg-white p-5 transition duration-200 hover:-translate-y-0.5 hover:shadow-xs">
                 <p className="text-xs font-bold uppercase tracking-widest text-slate-400">
                   Total shifts
                 </p>
-                <p className="mt-2 text-3xl font-bold">
+                <p className="mt-2 text-3xl font-extrabold text-slate-900 tracking-tight">
                   {shiftLoadStatus === "unauthenticated" ? "—" : schedule.length}
                 </p>
-                <p className="mt-1 text-xs text-slate-500">
+                <p className="mt-1 text-xs text-slate-500 font-medium">
                   {shiftLoadStatus === "unauthenticated"
                     ? "Sign in to view"
                     : "Live database records"}
                 </p>
-              </div>
-              <div className="rounded-2xl border border-slate-200 bg-white p-5">
+              </article>
+
+              <article className="rounded-2xl border border-slate-200 bg-white p-5 transition duration-200 hover:-translate-y-0.5 hover:shadow-xs">
                 <p className="text-xs font-bold uppercase tracking-widest text-slate-400">
                   Team on shift
                 </p>
-                <p className="mt-2 text-3xl font-bold">
+                <p className="mt-2 text-3xl font-extrabold text-slate-900 tracking-tight">
                   {team.filter((m) => m.status === "On shift").length}
                 </p>
                 <p className="mt-1 text-xs text-emerald-600 font-medium">Currently active</p>
-              </div>
-              <div className="rounded-2xl border border-slate-200 bg-white p-5">
+              </article>
+
+              <article className="rounded-2xl border border-slate-200 bg-white p-5 transition duration-200 hover:-translate-y-0.5 hover:shadow-xs">
                 <p className="text-xs font-bold uppercase tracking-widest text-slate-400">
                   Assigned members
                 </p>
-                <p className="mt-2 text-3xl font-bold">{team.length}</p>
-                <p className="mt-1 text-xs text-slate-500">Workspace roster</p>
-              </div>
-              <div className="rounded-2xl border border-slate-200 bg-white p-5">
+                <p className="mt-2 text-3xl font-extrabold text-slate-900 tracking-tight">{team.length}</p>
+                <p className="mt-1 text-xs text-slate-500 font-medium">Workspace roster</p>
+              </article>
+
+              <article className="rounded-2xl border border-slate-200 bg-white p-5 transition duration-200 hover:-translate-y-0.5 hover:shadow-xs">
                 <p className="text-xs font-bold uppercase tracking-widest text-slate-400">
                   Account Status
                 </p>
-                <p className="mt-2 text-lg font-bold text-slate-900">
+                <p className="mt-2 text-xl font-bold text-slate-900 truncate">
                   {authLoading ? (
                     <span className="text-slate-400 font-normal text-sm">Checking…</span>
                   ) : currentUser ? (
@@ -1332,7 +2039,7 @@ export default function Home() {
                     "Signed Out"
                   )}
                 </p>
-                <p className="mt-1 text-xs text-slate-500">
+                <p className="mt-1 text-xs text-slate-500 truncate font-medium">
                   {authLoading ? (
                     "Verifying session status…"
                   ) : currentUser ? (
@@ -1341,54 +2048,63 @@ export default function Home() {
                     "Sign in required to view shifts"
                   )}
                 </p>
-              </div>
+              </article>
             </div>
 
             {/* Team tab */}
             {activeTab === "Team" && (
-              <div className="mt-8 rounded-2xl border border-slate-200 bg-white p-6 shadow-xs">
-                <div className="flex flex-wrap items-center justify-between gap-4 mb-6">
+              <div className="mt-8 space-y-6">
+                <div className="flex flex-wrap items-center justify-between gap-4">
                   <div>
-                    <h2 className="text-lg font-bold">Workspace Team Members</h2>
-                    <p className="text-sm text-slate-500">
+                    <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">Your workspace</p>
+                    <h2 className="mt-1 text-2xl font-bold text-slate-900">Workspace Team Members</h2>
+                    <p className="mt-1 text-sm text-slate-500">
                       Active roster members with designated roles and live shift availability.
                     </p>
                   </div>
                   <button
                     type="button"
                     onClick={() => setShowInviteModal(true)}
-                    className="rounded-xl bg-slate-900 px-4 py-2 text-xs font-semibold text-white shadow-xs hover:bg-slate-800 transition"
+                    className="rounded-xl bg-slate-900 px-4 py-2.5 text-xs font-semibold text-white shadow-xs hover:bg-slate-800 transition flex items-center gap-1.5"
                   >
-                    + Invite Member
+                    <span>+</span>
+                    <span>Invite Member</span>
                   </button>
                 </div>
-                <div className="divide-y divide-slate-100">
+
+                <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
                   {team.map((member) => (
-                    <div
+                    <article
                       key={member.name}
-                      className="flex items-center justify-between py-4"
+                      className="rounded-2xl border border-slate-200 bg-white p-5 transition duration-200 hover:-translate-y-0.5 hover:shadow-sm flex flex-col justify-between"
                     >
-                      <div className="flex items-center gap-3">
-                        <div className="flex h-10 w-10 items-center justify-center rounded-full bg-slate-100 font-bold text-slate-700">
-                          {member.initials}
+                      <div>
+                        <div className="flex items-center gap-3.5">
+                          <div className="flex h-12 w-12 items-center justify-center rounded-full bg-lime-100 font-bold text-slate-800 text-sm shrink-0">
+                            {member.initials}
+                          </div>
+                          <div>
+                            <h3 className="font-semibold text-slate-900">{member.name}</h3>
+                            <p className="text-xs text-slate-500 mt-0.5">{member.role}</p>
+                          </div>
                         </div>
-                        <div>
-                          <p className="font-semibold text-slate-900">{member.name}</p>
-                          <p className="text-xs text-slate-500">{member.role}</p>
-                        </div>
+                        <div className="my-4 h-px bg-slate-100" />
                       </div>
-                      <span
-                        className={`rounded-full px-3 py-1 text-xs font-semibold ${
-                          member.status === "On shift"
-                            ? "bg-emerald-100 text-emerald-800"
-                            : member.status === "Upcoming"
-                            ? "bg-blue-100 text-blue-800"
-                            : "bg-slate-100 text-slate-600"
-                        }`}
-                      >
-                        {member.status}
-                      </span>
-                    </div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs text-slate-400 font-medium">Availability</span>
+                        <span
+                          className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                            member.status === "On shift"
+                              ? "bg-emerald-100 text-emerald-800"
+                              : member.status === "Upcoming"
+                              ? "bg-blue-100 text-blue-800"
+                              : "bg-slate-100 text-slate-600"
+                          }`}
+                        >
+                          {member.status}
+                        </span>
+                      </div>
+                    </article>
                   ))}
                 </div>
               </div>
@@ -1613,37 +2329,633 @@ export default function Home() {
                     </div>
                   </div>
 
-                  <div className="mt-6 border-t border-slate-100 pt-6 flex flex-wrap items-center justify-between gap-4">
-                    <div className="flex items-center gap-3">
-                      <input
-                        id="notifications-toggle"
-                        type="checkbox"
-                        checked={notificationsEnabled}
-                        onChange={(e) => setNotificationsEnabled(e.target.checked)}
-                        className="h-4 w-4 rounded border-slate-300 text-slate-900 focus:ring-slate-900"
-                      />
-                      <label htmlFor="notifications-toggle" className="text-xs font-medium text-slate-700">
-                        In-app shift update notifications enabled
-                      </label>
+                  {/* Settings Conflict Banner */}
+                  {settingsConflict && (
+                    <div className="mt-6 rounded-2xl border border-amber-300 bg-amber-50 p-5 text-amber-950 shadow-xs">
+                      <div className="flex items-start gap-3">
+                        <span className="text-xl">⚠️</span>
+                        <div className="flex-1">
+                          <h4 className="text-sm font-bold">Settings Conflict Detected</h4>
+                          <p className="mt-1 text-xs text-amber-800">
+                            Another device has modified your settings (Server Revision #{settingsConflict.revision} vs Local Revision #{userSettings?.revision ?? 1}). Choose how you want to resolve this conflict:
+                          </p>
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            <button
+                              type="button"
+                              onClick={handleReloadServerSettings}
+                              className="rounded-lg bg-amber-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-amber-700 transition"
+                            >
+                              Reload Server Settings (Rev #{settingsConflict.revision})
+                            </button>
+                            <button
+                              type="button"
+                              onClick={handleOverwriteServerSettings}
+                              disabled={savingSettings}
+                              className="rounded-lg border border-amber-400 bg-white px-3 py-1.5 text-xs font-semibold text-amber-900 hover:bg-amber-100 transition"
+                            >
+                              {savingSettings ? "Saving…" : "Overwrite with Local Changes (Force)"}
+                            </button>
+                          </div>
+                        </div>
+                      </div>
                     </div>
+                  )}
 
-                    {currentUser && (
+                  {/* Appearance & Regional Preferences */}
+                  <div className="mt-6 border-t border-slate-100 pt-6">
+                    <div className="rounded-xl border border-slate-200 bg-white p-5">
+                      <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+                        <div>
+                          <h3 className="text-sm font-bold text-slate-900">
+                            Appearance &amp; Regional Settings
+                          </h3>
+                          <p className="text-xs text-slate-500 mt-0.5">
+                            Customize your interface theme, preferred display language, and active timezone.
+                          </p>
+                        </div>
+                        {currentUser && (
+                          <div className="flex items-center gap-2">
+                            <span className="text-[11px] font-mono text-slate-500 bg-slate-100 px-2 py-1 rounded-md">
+                              Revision #{userSettings?.revision ?? 1}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => handleSaveUserSettings()}
+                              disabled={savingSettings}
+                              className="rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50 transition shadow-xs"
+                            >
+                              {savingSettings ? "Saving…" : "Save Settings"}
+                            </button>
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+                        {/* Theme */}
+                        <div>
+                          <label className="block font-semibold text-slate-800 mb-1.5">
+                            Color Theme
+                          </label>
+                          <div className="grid grid-cols-3 gap-1 rounded-xl border border-slate-200 bg-slate-50 p-1">
+                            {(["system", "light", "dark"] as const).map((t) => (
+                              <button
+                                key={t}
+                                type="button"
+                                onClick={() => {
+                                  if (userSettings) {
+                                    const next = { ...userSettings, theme: t };
+                                    setUserSettings(next);
+                                    applyThemeToDocument(t);
+                                  }
+                                }}
+                                className={`rounded-lg py-1.5 text-center font-medium capitalize transition ${
+                                  (userSettings?.theme || "system") === t
+                                    ? "bg-white text-slate-900 font-bold shadow-2xs"
+                                    : "text-slate-600 hover:text-slate-900"
+                                }`}
+                              >
+                                {t === "system" ? "💻 Auto" : t === "light" ? "☀️ Light" : "🌙 Dark"}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+
+                        {/* Language */}
+                        <div>
+                          <label htmlFor="settings-language" className="block font-semibold text-slate-800 mb-1.5">
+                            Display Language
+                          </label>
+                          <select
+                            id="settings-language"
+                            value={userSettings?.language || "en"}
+                            onChange={(e) => {
+                              const lang = e.target.value;
+                              if (userSettings) {
+                                setUserSettings({ ...userSettings, language: lang });
+                                applyLanguageToDocument(lang);
+                              }
+                            }}
+                            className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs text-slate-800 focus:border-slate-900"
+                          >
+                            {SUPPORTED_LANGUAGES.map((l) => (
+                              <option key={l.code} value={l.code}>
+                                {l.name} ({l.code})
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+
+                        {/* Timezone */}
+                        <div>
+                          <label htmlFor="settings-timezone" className="block font-semibold text-slate-800 mb-1.5">
+                            Workspace Timezone
+                          </label>
+                          <select
+                            id="settings-timezone"
+                            value={userSettings?.timezone || "UTC"}
+                            onChange={(e) => {
+                              const tz = e.target.value;
+                              if (userSettings) {
+                                setUserSettings({
+                                  ...userSettings,
+                                  timezone: tz,
+                                  quietHours: { ...userSettings.quietHours, timezone: tz },
+                                });
+                              }
+                            }}
+                            className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs text-slate-800 focus:border-slate-900"
+                          >
+                            {[
+                              "UTC",
+                              "Africa/Lagos",
+                              "Europe/London",
+                              "America/New_York",
+                              "America/Chicago",
+                              "America/Denver",
+                              "America/Los_Angeles",
+                              "Asia/Tokyo",
+                              "Asia/Dubai",
+                              "Australia/Sydney",
+                            ].map((tz) => (
+                              <option key={tz} value={tz}>
+                                {tz}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Notification Preferences & Quiet Hours */}
+                  <div className="mt-6 border-t border-slate-100 pt-6">
+                    <div className="rounded-xl border border-slate-200 bg-white p-5">
+                      <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+                        <div>
+                          <h3 className="text-sm font-bold text-slate-900">
+                            Notification Preferences &amp; Quiet Hours
+                          </h3>
+                          <p className="text-xs text-slate-500 mt-0.5">
+                            Customize alerts for shift assignments, updates, swaps, and mute notifications during quiet hours.
+                          </p>
+                        </div>
+                        {currentUser && (
+                          <button
+                            type="button"
+                            onClick={() => handleSaveUserSettings()}
+                            disabled={savingSettings}
+                            className="rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50 transition shadow-xs"
+                          >
+                            {savingSettings ? "Saving…" : "Save All Settings"}
+                          </button>
+                        )}
+                      </div>
+
+                      <div className="space-y-4 text-xs">
+                        {/* Master Toggle */}
+                        <div className="flex items-center gap-3">
+                          <input
+                            id="notifications-toggle"
+                            type="checkbox"
+                            checked={userSettings?.notifications?.enabled ?? notificationsEnabled}
+                            onChange={(e) => {
+                              const next = e.target.checked;
+                              setNotificationsEnabled(next);
+                              if (userSettings) {
+                                setUserSettings({
+                                  ...userSettings,
+                                  notifications: { ...userSettings.notifications, enabled: next },
+                                });
+                              }
+                              if (notificationPreferences) {
+                                setNotificationPreferences({ ...notificationPreferences, enabled: next });
+                              }
+                            }}
+                            className="h-4 w-4 rounded border-slate-300 text-slate-900 focus:ring-slate-900"
+                          />
+                          <label htmlFor="notifications-toggle" className="font-semibold text-slate-800">
+                            Enable In-App &amp; Web Push Notifications
+                          </label>
+                        </div>
+
+                        {/* Category Toggles */}
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pl-7 border-l-2 border-slate-100">
+                          <label className="flex items-center gap-2 text-slate-700">
+                            <input
+                              type="checkbox"
+                              checked={userSettings?.notifications?.categories?.shift_assigned ?? notificationPreferences?.categories?.shift_assigned ?? true}
+                              onChange={(e) => {
+                                const next = e.target.checked;
+                                if (userSettings) {
+                                  setUserSettings({
+                                    ...userSettings,
+                                    notifications: {
+                                      ...userSettings.notifications,
+                                      categories: { ...userSettings.notifications.categories, shift_assigned: next },
+                                    },
+                                  });
+                                }
+                                if (notificationPreferences) {
+                                  setNotificationPreferences({
+                                    ...notificationPreferences,
+                                    categories: { ...notificationPreferences.categories, shift_assigned: next },
+                                  });
+                                }
+                              }}
+                              className="h-3.5 w-3.5 rounded border-slate-300 text-slate-900"
+                            />
+                            New shift assignments
+                          </label>
+
+                          <label className="flex items-center gap-2 text-slate-700">
+                            <input
+                              type="checkbox"
+                              checked={userSettings?.notifications?.categories?.shift_updated ?? notificationPreferences?.categories?.shift_updated ?? true}
+                              onChange={(e) => {
+                                const next = e.target.checked;
+                                if (userSettings) {
+                                  setUserSettings({
+                                    ...userSettings,
+                                    notifications: {
+                                      ...userSettings.notifications,
+                                      categories: { ...userSettings.notifications.categories, shift_updated: next },
+                                    },
+                                  });
+                                }
+                                if (notificationPreferences) {
+                                  setNotificationPreferences({
+                                    ...notificationPreferences,
+                                    categories: { ...notificationPreferences.categories, shift_updated: next },
+                                  });
+                                }
+                              }}
+                              className="h-3.5 w-3.5 rounded border-slate-300 text-slate-900"
+                            />
+                            Shift schedule updates
+                          </label>
+
+                          <label className="flex items-center gap-2 text-slate-700">
+                            <input
+                              type="checkbox"
+                              checked={userSettings?.notifications?.categories?.swap_requested ?? notificationPreferences?.categories?.swap_requested ?? true}
+                              onChange={(e) => {
+                                const next = e.target.checked;
+                                if (userSettings) {
+                                  setUserSettings({
+                                    ...userSettings,
+                                    notifications: {
+                                      ...userSettings.notifications,
+                                      categories: { ...userSettings.notifications.categories, swap_requested: next },
+                                    },
+                                  });
+                                }
+                                if (notificationPreferences) {
+                                  setNotificationPreferences({
+                                    ...notificationPreferences,
+                                    categories: { ...notificationPreferences.categories, swap_requested: next },
+                                  });
+                                }
+                              }}
+                              className="h-3.5 w-3.5 rounded border-slate-300 text-slate-900"
+                            />
+                            Shift swap requests
+                          </label>
+
+                          <label className="flex items-center gap-2 text-slate-700">
+                            <input
+                              type="checkbox"
+                              checked={userSettings?.notifications?.categories?.swap_approved ?? notificationPreferences?.categories?.swap_approved ?? true}
+                              onChange={(e) => {
+                                const next = e.target.checked;
+                                if (userSettings) {
+                                  setUserSettings({
+                                    ...userSettings,
+                                    notifications: {
+                                      ...userSettings.notifications,
+                                      categories: { ...userSettings.notifications.categories, swap_approved: next },
+                                    },
+                                  });
+                                }
+                                if (notificationPreferences) {
+                                  setNotificationPreferences({
+                                    ...notificationPreferences,
+                                    categories: { ...notificationPreferences.categories, swap_approved: next },
+                                  });
+                                }
+                              }}
+                              className="h-3.5 w-3.5 rounded border-slate-300 text-slate-900"
+                            />
+                            Swap approvals &amp; decisions
+                          </label>
+                        </div>
+
+                        {/* Quiet Hours */}
+                        <div className="pt-3 border-t border-slate-100 space-y-3">
+                          <label className="flex items-center gap-2 font-semibold text-slate-800">
+                            <input
+                              type="checkbox"
+                              checked={userSettings?.quietHours?.enabled ?? notificationPreferences?.quietHours?.enabled ?? false}
+                              onChange={(e) => {
+                                const next = e.target.checked;
+                                if (userSettings) {
+                                  setUserSettings({
+                                    ...userSettings,
+                                    quietHours: { ...userSettings.quietHours, enabled: next },
+                                  });
+                                }
+                                if (notificationPreferences) {
+                                  setNotificationPreferences({
+                                    ...notificationPreferences,
+                                    quietHours: { ...notificationPreferences.quietHours, enabled: next },
+                                  });
+                                }
+                              }}
+                              className="h-4 w-4 rounded border-slate-300 text-slate-900"
+                            />
+                            Quiet Hours (Mute delivery during rest hours)
+                          </label>
+
+                          {(userSettings?.quietHours?.enabled ?? notificationPreferences?.quietHours?.enabled) && (
+                            <div className="flex flex-wrap items-center gap-4 pl-6 text-slate-600">
+                              <div className="flex items-center gap-2">
+                                <span>From:</span>
+                                <input
+                                  type="time"
+                                  value={userSettings?.quietHours?.start || notificationPreferences?.quietHours?.start || "22:00"}
+                                  onChange={(e) => {
+                                    const next = e.target.value;
+                                    if (userSettings) {
+                                      setUserSettings({
+                                        ...userSettings,
+                                        quietHours: { ...userSettings.quietHours, start: next },
+                                      });
+                                    }
+                                    if (notificationPreferences) {
+                                      setNotificationPreferences({
+                                        ...notificationPreferences,
+                                        quietHours: { ...notificationPreferences.quietHours, start: next },
+                                      });
+                                    }
+                                  }}
+                                  className="rounded-lg border border-slate-300 px-2 py-1 text-xs"
+                                />
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <span>To:</span>
+                                <input
+                                  type="time"
+                                  value={userSettings?.quietHours?.end || notificationPreferences?.quietHours?.end || "08:00"}
+                                  onChange={(e) => {
+                                    const next = e.target.value;
+                                    if (userSettings) {
+                                      setUserSettings({
+                                        ...userSettings,
+                                        quietHours: { ...userSettings.quietHours, end: next },
+                                      });
+                                    }
+                                    if (notificationPreferences) {
+                                      setNotificationPreferences({
+                                        ...notificationPreferences,
+                                        quietHours: { ...notificationPreferences.quietHours, end: next },
+                                      });
+                                    }
+                                  }}
+                                  className="rounded-lg border border-slate-300 px-2 py-1 text-xs"
+                                />
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <span>Timezone:</span>
+                                <span className="font-mono text-slate-800 bg-slate-100 px-2 py-0.5 rounded">
+                                  {userSettings?.quietHours?.timezone || notificationPreferences?.quietHours?.timezone || "UTC"}
+                                </span>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                    <div className="mt-6 flex flex-wrap items-center justify-end gap-3">
+                      {currentUser && (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => handleLogout(false)}
+                            className="rounded-xl border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 transition"
+                          >
+                            Sign Out (This Device)
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleLogout(true)}
+                            className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-2 text-xs font-semibold text-rose-700 hover:bg-rose-100 transition"
+                          >
+                            Sign Out of All Devices
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+            {/* Activity tab */}
+            {activeTab === "Activity" && (
+              <div className="mt-8 space-y-6">
+                <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs">
+                  <div className="flex flex-wrap items-center justify-between gap-4 pb-5 border-b border-slate-100">
+                    <div>
+                      <h2 className="text-lg font-bold text-slate-900">Workspace Activity Feed</h2>
+                      <p className="text-xs sm:text-sm text-slate-500 mt-0.5">
+                        Real-time audit timeline of scheduling events, shift swaps, and team changes.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => loadActivityFirstPage(true)}
+                      disabled={activityLoading || activityRefreshing}
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 shadow-2xs hover:bg-slate-50 transition disabled:opacity-50"
+                    >
+                      <span className={activityRefreshing ? "animate-spin" : ""}>↻</span>
+                      {activityRefreshing ? "Refreshing…" : "Refresh Feed"}
+                    </button>
+                  </div>
+
+                  {/* Error State with Retry Button */}
+                  {activityError && (
+                    <div className="mt-4 rounded-xl border border-rose-200 bg-rose-50 p-4 text-xs text-rose-800 flex items-center justify-between gap-3">
+                      <div>
+                        <p className="font-bold">Error loading activity feed</p>
+                        <p className="mt-0.5 text-rose-600">{activityError}</p>
+                      </div>
                       <button
                         type="button"
-                        onClick={handleLogout}
-                        className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-2 text-xs font-semibold text-rose-700 hover:bg-rose-100 transition"
+                        onClick={() =>
+                          activityEvents.length === 0
+                            ? loadActivityFirstPage(false)
+                            : loadActivityNextPage()
+                        }
+                        className="rounded-lg bg-rose-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-rose-800 transition"
                       >
-                        Sign Out of Session
+                        ↺ Retry
                       </button>
-                    )}
-                  </div>
+                    </div>
+                  )}
+
+                  {/* Initial Loading Skeleton State */}
+                  {activityLoading && (
+                    <div className="mt-6 space-y-4 animate-pulse" aria-label="Loading activity feed">
+                      {[1, 2, 3, 4].map((i) => (
+                        <div key={i} className="flex items-start gap-4 rounded-xl border border-slate-100 p-4">
+                          <div className="h-10 w-10 rounded-full bg-slate-200 shrink-0"></div>
+                          <div className="flex-1 space-y-2">
+                            <div className="h-4 w-1/3 bg-slate-200 rounded"></div>
+                            <div className="h-3.5 w-3/4 bg-slate-100 rounded"></div>
+                            <div className="h-3 w-1/4 bg-slate-100 rounded"></div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Empty State */}
+                  {!activityLoading && activityEvents.length === 0 && !activityError && (
+                    <div className="mt-8 text-center py-12 rounded-xl border border-dashed border-slate-200 bg-slate-50/50 p-6">
+                      <div className="text-3xl select-none mb-2">📋</div>
+                      <h3 className="text-sm font-bold text-slate-800">No activity recorded yet</h3>
+                      <p className="text-xs text-slate-500 max-w-sm mx-auto mt-1">
+                        When shifts are created, modified, or swapped, audit events will appear here in chronological order.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => loadActivityFirstPage(true)}
+                        className="mt-4 inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100"
+                      >
+                        ↻ Check for updates
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Activity Events List */}
+                  {!activityLoading && activityEvents.length > 0 && (
+                    <div className="mt-6 space-y-3">
+                      {activityEvents.map((evt) => {
+                        const isShift = evt.action.startsWith("shift_");
+                        const isSwap = evt.action.startsWith("swap_");
+                        const isDelete = evt.action === "shift_deleted" || evt.action === "swap_rejected";
+                        const isApproved = evt.action === "swap_approved";
+                        const icon = isDelete ? "🗑️" : isApproved ? "✓" : isSwap ? "🔄" : isShift ? "📅" : "📋";
+                        const badgeColor = isDelete
+                          ? "bg-rose-50 text-rose-700 border-rose-200"
+                          : isApproved
+                          ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                          : isSwap
+                          ? "bg-amber-50 text-amber-700 border-amber-200"
+                          : "bg-blue-50 text-blue-700 border-blue-200";
+
+                        return (
+                          <div
+                            key={evt.id}
+                            className="flex items-start justify-between gap-4 rounded-xl border border-slate-100 bg-white p-4 shadow-2xs hover:border-slate-200 transition"
+                          >
+                            <div className="flex items-start gap-3.5">
+                              <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-slate-100 text-sm shrink-0 select-none">
+                                {icon}
+                              </div>
+                              <div>
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <span className="font-bold text-xs text-slate-900">{evt.actor_name}</span>
+                                  <span className={`rounded-md border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider ${badgeColor}`}>
+                                    {evt.action.replace("_", " ")}
+                                  </span>
+                                </div>
+                                <p className="text-xs text-slate-700 mt-1 leading-relaxed">{evt.description}</p>
+                                <p className="text-[11px] text-slate-400 mt-1">
+                                  {new Date(evt.created_at).toLocaleString(undefined, {
+                                    month: "short",
+                                    day: "numeric",
+                                    hour: "2-digit",
+                                    minute: "2-digit",
+                                    second: "2-digit",
+                                  })}
+                                </p>
+                              </div>
+                            </div>
+                            {evt.entity_id && (
+                              <span className="shrink-0 text-[10px] font-mono text-slate-400 bg-slate-50 px-2 py-0.5 rounded border border-slate-200/60">
+                                #{evt.entity_id}
+                              </span>
+                            )}
+                          </div>
+                        );
+                      })}
+
+                      {/* Infinite Scroll Sentinel and Load More Footer */}
+                      <div ref={activitySentinelRef} className="pt-4 flex flex-col items-center justify-center">
+                        {activityLoadingMore && (
+                          <div className="flex items-center gap-2 text-xs font-semibold text-slate-500 py-3">
+                            <span className="animate-spin text-sm">↻</span> Loading older activities…
+                          </div>
+                        )}
+
+                        {!activityLoadingMore && activityHasMore && (
+                          <button
+                            type="button"
+                            onClick={loadActivityNextPage}
+                            className="rounded-xl border border-slate-300 bg-white px-5 py-2 text-xs font-semibold text-slate-700 shadow-2xs hover:bg-slate-50 transition"
+                          >
+                            Load More Activities ↓
+                          </button>
+                        )}
+
+                        {!activityHasMore && activityEvents.length > 0 && (
+                          <p className="text-xs text-slate-400 py-2">
+                            ✓ You have reached the end of the activity history.
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             )}
 
             {/* Schedule & Overview tab */}
-            {activeTab !== "Team" && activeTab !== "Settings" && (
+            {activeTab !== "Team" && activeTab !== "Settings" && activeTab !== "Activity" && (
               <>
+                {/* Offline Resilience Warning Banner */}
+                {isOfflineSchedule && (
+                  <div className="mt-8 rounded-2xl border border-amber-300 bg-amber-50/90 p-4.5 shadow-xs">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div className="flex items-center gap-3">
+                        <span className="flex h-3 w-3 relative shrink-0">
+                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
+                          <span className="relative inline-flex rounded-full h-3 w-3 bg-amber-500"></span>
+                        </span>
+                        <div>
+                          <p className="text-xs font-bold uppercase tracking-wider text-amber-950">Offline Resilience Active</p>
+                          <p className="text-xs font-medium text-amber-800 mt-0.5">
+                            Displaying cached schedule from local storage. Schedule edits will synchronize automatically when your connection is restored.
+                          </p>
+                        </div>
+                      </div>
+                      {offlineTimestamp && (
+                        <div className="rounded-xl border border-amber-200/80 bg-white/80 px-3 py-1.5 text-xs font-semibold text-amber-900 shadow-2xs">
+                          Last updated:{" "}
+                          <span className="font-mono text-amber-950">
+                            {new Date(offlineTimestamp).toLocaleTimeString([], {
+                              hour: "2-digit",
+                              minute: "2-digit",
+                              second: "2-digit",
+                            })}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
                 {/* Pending Shift Swap Requests */}
                 {swapRequests.length > 0 && (
                   <div className="mt-8 rounded-2xl border border-amber-200 bg-amber-50/80 p-5 shadow-xs">
@@ -1663,10 +2975,14 @@ export default function Home() {
                         >
                           <div>
                             <p className="font-semibold text-slate-900">
-                              {req.requesterName} <span className="font-normal text-slate-500">requested swap with</span> {req.targetEmployeeName}
+                              {req.requester_name || `Employee #${req.requester_user_id}`}{" "}
+                              <span className="font-normal text-slate-500">requested swap with</span>{" "}
+                              {req.target_employee_name || `Employee #${req.target_user_id}`}
                             </p>
                             <p className="text-slate-500 mt-0.5">
-                              Shift: {req.shiftDay} · Note: &ldquo;{req.reason}&rdquo; · Requested at {req.createdAt}
+                              Shift: {req.source_shift_day || `Shift #${req.source_shift_id}`}{" "}
+                              {req.reason ? `· Note: “${req.reason}”` : ""} · Requested at{" "}
+                              {req.created_at ? new Date(req.created_at).toLocaleString() : ""}
                             </p>
                           </div>
                           <div className="flex items-center gap-2">
@@ -1675,14 +2991,14 @@ export default function Home() {
                                 <>
                                   <button
                                     type="button"
-                                    onClick={() => handleApproveSwap(req)}
+                                    onClick={() => handleApproveSwap(req.id)}
                                     className="rounded-lg bg-emerald-600 px-3 py-1 font-semibold text-white hover:bg-emerald-700 transition"
                                   >
                                     Approve
                                   </button>
                                   <button
                                     type="button"
-                                    onClick={() => handleDeclineSwap(req.id)}
+                                    onClick={() => handleRejectSwap(req.id)}
                                     className="rounded-lg border border-slate-300 bg-white px-3 py-1 font-semibold text-slate-700 hover:bg-slate-100 transition"
                                   >
                                     Decline
@@ -1709,9 +3025,10 @@ export default function Home() {
                   </div>
                 )}
 
-                <div className="mt-8 flex flex-wrap items-center justify-between gap-4">
+                <div className="mt-8 flex flex-wrap items-end justify-between gap-4">
                   <div>
-                    <h2 className="text-lg font-bold">
+                    <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">Your workspace</p>
+                    <h2 className="mt-1 text-2xl font-bold text-slate-900">
                       {activeTab === "Schedule"
                         ? "Full Shift Schedule"
                         : "Upcoming Scheduled Shifts"}
@@ -1724,7 +3041,7 @@ export default function Home() {
                     onClick={() =>
                       setActiveTab(activeTab === "Schedule" ? "Overview" : "Schedule")
                     }
-                    className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold hover:bg-slate-50 transition"
+                    className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-800 hover:bg-slate-50 transition shadow-2xs"
                   >
                     {activeTab === "Schedule"
                       ? "Back to overview"
@@ -2272,20 +3589,24 @@ export default function Home() {
                   htmlFor="swap-target"
                   className="block text-xs font-semibold uppercase tracking-wider text-slate-600 mb-1"
                 >
-                  Swap With Team Member
+                  Swap With Eligible Shift
                 </label>
                 <select
                   id="swap-target"
                   required
-                  value={swapTarget}
-                  onChange={(e) => setSwapTarget(e.target.value)}
+                  value={swapTargetShiftId ?? ""}
+                  onChange={(e) => setSwapTargetShiftId(Number(e.target.value))}
                   className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm"
                 >
-                  {team
-                    .filter((m) => m.name !== swappingShift.name)
-                    .map((m) => (
-                      <option key={m.name} value={m.name}>
-                        {m.name} ({m.role})
+                  {schedule
+                    .filter(
+                      (s) =>
+                        s.id !== swappingShift.id &&
+                        (swappingShift.userId ? s.userId !== swappingShift.userId : s.name !== swappingShift.name)
+                    )
+                    .map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.name} ({s.role}) — {s.day}, {s.date} ({s.start} - {s.end})
                       </option>
                     ))}
                 </select>

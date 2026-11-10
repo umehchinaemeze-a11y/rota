@@ -32,6 +32,7 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env.example
 
 # vercel
 .vercel
@@ -47,3 +48,9 @@ next-env.d.ts
 # Temporary Cloudflare tunnel artifacts
 cloudflared.log
 tunnel-url.txt
+
+.vercel
+.env*
+
+# build artifacts
+*.apk

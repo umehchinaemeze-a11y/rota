@@ -147,6 +147,15 @@ export async function handlePostRecoverShifts(
       sql: executeSql,
     });
 
+    if (result.recoveredCount > 0 && targetTeamId) {
+      try {
+        const { invalidateTeamCache } = await import("../../../../lib/cache.ts");
+        await invalidateTeamCache(targetTeamId);
+      } catch {
+        // Cache invalidation fails open
+      }
+    }
+
     return Response.json(result, { status: 200 });
   } catch (error: any) {
     if (error instanceof ShiftRecoveryError) {

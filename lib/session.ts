@@ -1,5 +1,12 @@
 import { verifySessionToken, type SessionPayload } from "./auth.ts";
 
+export {
+  REFRESH_COOKIE_NAME,
+  getRefreshCookieOptions,
+  serializeRefreshCookie,
+  clearRefreshCookie,
+} from "./refresh-tokens.ts";
+
 export const SESSION_COOKIE_NAME = "rota_session";
 export const SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 7; // 7 days
 
@@ -71,6 +78,27 @@ export async function getSessionUser(options?: {
 
     if (options?.revalidateWithDb) {
       const { sql } = await import("./db");
+
+      // If token is associated with a database-backed session, verify it has not been revoked or expired
+      if (payload.sessionId) {
+        try {
+          const sessionRows = await sql`
+            SELECT revoked, expires_at
+            FROM auth_sessions
+            WHERE session_id = ${payload.sessionId}
+            LIMIT 1;
+          `;
+          if (sessionRows && sessionRows.length > 0) {
+            const sess = sessionRows[0];
+            if (sess.revoked || new Date(sess.expires_at).getTime() <= Date.now()) {
+              return null; // Session explicitly revoked or expired on server
+            }
+          }
+        } catch {
+          // If auth_sessions table does not exist yet, allow fallback for legacy environments
+        }
+      }
+
       const rows = await sql`
         SELECT id, email, name, role
         FROM users

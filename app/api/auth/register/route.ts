@@ -1,9 +1,16 @@
 import { hashPassword, createSessionToken } from "../../../../lib/auth.ts";
 import { getAuthSecret, serializeSessionCookie } from "../../../../lib/session.ts";
+import {
+  createAuthSession,
+  serializeRefreshCookie,
+  ACCESS_TOKEN_TTL_SECONDS,
+} from "../../../../lib/refresh-tokens.ts";
+import { enforceRateLimit } from "../../../../lib/rate-limit.ts";
 
 export type RegisterRouteDependencies = {
   sql?: (strings: TemplateStringsArray, ...values: any[]) => Promise<any>;
   getSecret?: () => string;
+  skipRateLimit?: boolean;
 };
 
 let prodSqlPromise: Promise<any> | null = null;
@@ -20,6 +27,16 @@ export async function handleRegister(
   deps: RegisterRouteDependencies = {}
 ): Promise<Response> {
   try {
+    if (!deps.skipRateLimit) {
+      const { response: rateLimitResp } = await enforceRateLimit(request, {
+        action: "register",
+        limit: 10,
+        windowSeconds: 60,
+      });
+      if (rateLimitResp) {
+        return rateLimitResp;
+      }
+    }
     let body: unknown;
     try {
       body = await request.json();
@@ -113,6 +130,16 @@ export async function handleRegister(
 
     const newUser = insertedRows[0];
 
+    const userAgent = request.headers.get("user-agent") ?? undefined;
+    const ipAddress =
+      request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? undefined;
+
+    const authSession = await createAuthSession(sql, {
+      userId: newUser.id,
+      userAgent,
+      ipAddress,
+    });
+
     // Issue signed session token
     const token = createSessionToken(
       {
@@ -120,11 +147,13 @@ export async function handleRegister(
         email: newUser.email,
         name: newUser.name,
         role: newUser.role,
+        sessionId: authSession.sessionId,
       },
-      secret
+      secret,
+      ACCESS_TOKEN_TTL_SECONDS
     );
 
-    return Response.json(
+    const response = Response.json(
       {
         success: true,
         message: "Account created successfully.",
@@ -137,11 +166,19 @@ export async function handleRegister(
       },
       {
         status: 201,
-        headers: {
-          "Set-Cookie": serializeSessionCookie(token),
-        },
       }
     );
+
+    response.headers.append(
+      "Set-Cookie",
+      serializeSessionCookie(token, ACCESS_TOKEN_TTL_SECONDS, request)
+    );
+    response.headers.append(
+      "Set-Cookie",
+      serializeRefreshCookie(authSession.refreshToken, undefined, request)
+    );
+
+    return response;
   } catch (error) {
     console.error("Registration processing error occurred.");
     return Response.json(
