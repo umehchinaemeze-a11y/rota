@@ -4,7 +4,7 @@ import { ACCESS_TOKEN_TTL_SECONDS } from "../refresh-tokens.ts";
 import type { AuthUserRecord } from "./users.ts";
 
 export function createUserSessionCookie(
-  user: AuthUserRecord,
+  user: AuthUserRecord & { teamId?: number | null },
   secret: string = getAuthSecret(),
   sessionId?: string
 ): string {
@@ -14,6 +14,7 @@ export function createUserSessionCookie(
       email: user.email,
       name: user.name,
       role: user.role,
+      teamId: user.teamId ?? null,
       ...(sessionId ? { sessionId } : {}),
     },
     secret,

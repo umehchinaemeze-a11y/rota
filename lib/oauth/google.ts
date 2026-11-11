@@ -69,15 +69,30 @@ export function getGoogleConfig(
     configuredRedirect ||
     (appUrl
       ? `${appUrl}/api/auth/google/callback`
-      : env.NODE_ENV !== "production"
-        ? "http://localhost:3000/api/auth/google/callback"
-        : "");
+      : env.VERCEL_PROJECT_PRODUCTION_URL
+        ? `https://${env.VERCEL_PROJECT_PRODUCTION_URL.replace(/\/+$/, "")}/api/auth/google/callback`
+        : env.VERCEL_URL
+          ? `https://${env.VERCEL_URL.replace(/\/+$/, "")}/api/auth/google/callback`
+          : env.NODE_ENV === "production"
+            ? "https://rota-lovat-gamma.vercel.app/api/auth/google/callback"
+            : "http://localhost:3000/api/auth/google/callback");
 
   if (!clientId || !clientSecret || !redirectUri) {
     throw new Error("Google authentication is not configured.");
   }
 
   return { clientId, clientSecret, redirectUri };
+}
+
+export function isGoogleAuthAvailable(
+  env: Record<string, string | undefined> = process.env
+): boolean {
+  try {
+    const config = getGoogleConfig(env);
+    return Boolean(config.clientId && config.clientSecret && config.redirectUri);
+  } catch {
+    return false;
+  }
 }
 
 export function buildGoogleAuthorizationUrl(

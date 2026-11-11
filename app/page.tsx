@@ -135,6 +135,10 @@ export default function Home() {
   const [newWorkspaceName, setNewWorkspaceName] = useState("");
   const [creatingWorkspace, setCreatingWorkspace] = useState(false);
   const [workspaceError, setWorkspaceError] = useState("");
+  const [workspaceMembershipState, setWorkspaceMembershipState] =
+    useState<"idle" | "checking" | "has_workspace" | "no_workspace" | "verification_error">("idle");
+  const [membershipErrorMessage, setMembershipErrorMessage] = useState("");
+  const isCreatingWorkspaceRef = useRef(false);
 
   // Legacy Shift Recovery states
   const [recoverableShifts, setRecoverableShifts] = useState<RecoverableShift[]>([]);
@@ -225,6 +229,66 @@ export default function Home() {
     } finally {
       clearTimeout(timeoutId);
       setAuthLoading(false);
+    }
+  }, []);
+
+  const verifyWorkspaceMembership = useCallback(async (user: AuthUser | null) => {
+    if (!user) {
+      setWorkspaceMembershipState("idle");
+      setMembershipErrorMessage("");
+      return null;
+    }
+
+    setWorkspaceMembershipState("checking");
+    setMembershipErrorMessage("");
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
+
+    try {
+      const res = await fetch("/api/teams", { signal: controller.signal });
+      clearTimeout(timeoutId);
+
+      if (res.status === 401) {
+        setCurrentUser(null);
+        setWorkspaceMembershipState("idle");
+        return null;
+      }
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        const errorMsg =
+          data?.error ||
+          "Unable to verify existing workspace memberships. Please try again.";
+        setWorkspaceMembershipState("verification_error");
+        setMembershipErrorMessage(errorMsg);
+        return null;
+      }
+
+      const data = await res.json().catch(() => null);
+      const teamsList: UserWorkspace[] =
+        data && Array.isArray(data.teams) ? data.teams : [];
+
+      if (teamsList.length > 0) {
+        setWorkspaceMembershipState("has_workspace");
+        const defaultTeam = teamsList.find((t) => t.is_default) || teamsList[0];
+        if (!user.teamId || !teamsList.some((t) => t.id === user.teamId)) {
+          setCurrentUser((prev) =>
+            prev ? { ...prev, teamId: defaultTeam.id, role: defaultTeam.role } : null
+          );
+        }
+        return teamsList;
+      } else {
+        setWorkspaceMembershipState("no_workspace");
+        return [];
+      }
+    } catch {
+      clearTimeout(timeoutId);
+      setWorkspaceMembershipState("verification_error");
+      setMembershipErrorMessage(
+        "Unable to verify existing workspace memberships. Please check your connection and try again."
+      );
+      return null;
     }
   }, []);
 
@@ -719,18 +783,30 @@ export default function Home() {
         if (!active) return;
 
         if (user) {
-          await loadShifts();
+          const verifiedTeams = await verifyWorkspaceMembership(user);
           if (!active) return;
 
-          // Non-blocking parallel execution for independent workspace features
-          await Promise.allSettled([
-            checkRecoverableShifts(user),
-            loadBillingStatus(user),
-            loadSwapRequests(),
-            loadNotifications(),
-            loadUserSettings(user),
-          ]);
-          if (!active) return;
+          if (verifiedTeams && verifiedTeams.length > 0) {
+            await loadShifts();
+            if (!active) return;
+
+            // Non-blocking parallel execution for independent workspace features
+            await Promise.allSettled([
+              checkRecoverableShifts(user),
+              loadBillingStatus(user),
+              loadSwapRequests(),
+              loadNotifications(),
+              loadUserSettings(user),
+            ]);
+            if (!active) return;
+          } else if (verifiedTeams && verifiedTeams.length === 0) {
+            // Confirmed no workspace: clear schedule safely
+            setSchedule([]);
+            setLoading(false);
+          } else {
+            // Verification error: stop loading, show explicit failure card
+            setLoading(false);
+          }
 
           // Check if returning from checkout with reference (Paystack) or deep link
           if (typeof window !== "undefined") {
@@ -771,6 +847,8 @@ export default function Home() {
           }
         } else {
           // Unauthenticated: set unauthenticated state safely
+          setWorkspaceMembershipState("idle");
+          setMembershipErrorMessage("");
           setSchedule([]);
           setShiftLoadStatus("unauthenticated");
           setStatusMessage("Sign in required to view shifts. Please sign in to access your team schedule.");
@@ -803,7 +881,7 @@ export default function Home() {
     return () => {
       active = false;
     };
-  }, [checkSession, loadShifts, checkRecoverableShifts, loadBillingStatus, loadSwapRequests, loadNotifications, loadUserSettings]);
+  }, [checkSession, verifyWorkspaceMembership, loadShifts, checkRecoverableShifts, loadBillingStatus, loadSwapRequests, loadNotifications, loadUserSettings]);
 
   async function handleLogin(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -830,12 +908,20 @@ export default function Home() {
       setLoginEmail("");
       setLoginPassword("");
       setNotice(`Signed in securely as ${data.name} (${data.role}).`);
-      await loadShifts();
-      await checkRecoverableShifts(data);
-      await loadBillingStatus(data);
-      await loadSwapRequests();
-      await loadNotifications();
-      await loadUserSettings(data);
+      const verifiedTeams = await verifyWorkspaceMembership(data);
+      if (verifiedTeams && verifiedTeams.length > 0) {
+        await loadShifts();
+        await checkRecoverableShifts(data);
+        await loadBillingStatus(data);
+        await loadSwapRequests();
+        await loadNotifications();
+        await loadUserSettings(data);
+      } else if (verifiedTeams && verifiedTeams.length === 0) {
+        setSchedule([]);
+        setLoading(false);
+      } else {
+        setLoading(false);
+      }
     } catch (err) {
       setLoginError(err instanceof Error ? err.message : "Unable to sign in.");
     } finally {
@@ -846,13 +932,14 @@ export default function Home() {
   async function handleCreateWorkspace(e: React.FormEvent) {
     e.preventDefault();
     const trimmed = newWorkspaceName.trim();
-    if (!trimmed || creatingWorkspace) return;
+    if (!trimmed || creatingWorkspace || isCreatingWorkspaceRef.current) return;
 
     if (trimmed.length < 2) {
       setWorkspaceError("Workspace name must be at least 2 characters.");
       return;
     }
 
+    isCreatingWorkspaceRef.current = true;
     setCreatingWorkspace(true);
     setWorkspaceError("");
     setError("");
@@ -875,14 +962,15 @@ export default function Home() {
       const user = await checkSession();
       if (user) {
         setCurrentUser(user);
-      }
-      await loadShifts();
-      if (user) {
-        await checkRecoverableShifts(user);
-        await loadBillingStatus(user);
-        await loadSwapRequests();
-        await loadNotifications();
-        await loadUserSettings(user);
+        const verifiedTeams = await verifyWorkspaceMembership(user);
+        if (verifiedTeams && verifiedTeams.length > 0) {
+          await loadShifts();
+          await checkRecoverableShifts(user);
+          await loadBillingStatus(user);
+          await loadSwapRequests();
+          await loadNotifications();
+          await loadUserSettings(user);
+        }
       }
     } catch (err: unknown) {
       setWorkspaceError(
@@ -890,6 +978,7 @@ export default function Home() {
       );
     } finally {
       setCreatingWorkspace(false);
+      isCreatingWorkspaceRef.current = false;
     }
   }
 
@@ -899,6 +988,8 @@ export default function Home() {
         method: "POST",
       });
       setCurrentUser(null);
+      setWorkspaceMembershipState("idle");
+      setMembershipErrorMessage("");
       setSwapRequests([]);
       setUserNotifications([]);
       setUnreadNotificationsCount(0);
@@ -3050,7 +3141,7 @@ export default function Home() {
                   </button>
                 </div>
 
-                {loading ? (
+                {loading || (currentUser && workspaceMembershipState === "checking") ? (
                   <div className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-3 animate-pulse" aria-label="Loading shifts">
                     {[1, 2, 3].map((skeletonIdx) => (
                       <div
@@ -3069,7 +3160,7 @@ export default function Home() {
                       </div>
                     ))}
                   </div>
-                ) : shiftLoadStatus === "unauthenticated" ? (
+                ) : !currentUser || shiftLoadStatus === "unauthenticated" ? (
                   <div className="mt-5 rounded-2xl border border-slate-200 bg-white p-8 text-center shadow-sm">
                     <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-slate-100 text-xl">
                       🔐
@@ -3097,7 +3188,39 @@ export default function Home() {
                       </Link>
                     </div>
                   </div>
-                ) : shiftLoadStatus === "forbidden" ? (
+                ) : workspaceMembershipState === "verification_error" ? (
+                  <div className="mt-5 rounded-2xl border border-rose-200 bg-rose-50 p-8 text-center shadow-sm">
+                    <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-rose-100 text-xl text-rose-800">
+                      ⚠
+                    </div>
+                    <h3 className="mt-3 text-base font-bold text-rose-900">
+                      Unable to Verify Workspace Membership
+                    </h3>
+                    <p className="mx-auto mt-2 max-w-md text-sm leading-relaxed text-rose-700">
+                      {membershipErrorMessage ||
+                        "Unable to verify existing workspace memberships. Please try again."}
+                    </p>
+                    <div className="mt-5 flex items-center justify-center gap-3">
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          const user = currentUserRef.current;
+                          if (user) {
+                            const teams = await verifyWorkspaceMembership(user);
+                            if (teams && teams.length > 0) {
+                              await loadShifts();
+                            }
+                          } else {
+                            await checkSession();
+                          }
+                        }}
+                        className="inline-flex items-center gap-2 rounded-xl bg-rose-700 px-5 py-2.5 text-sm font-semibold text-white shadow transition hover:bg-rose-800 focus:outline-none focus:ring-2 focus:ring-rose-500/20"
+                      >
+                        ↻ Retry Verification
+                      </button>
+                    </div>
+                  </div>
+                ) : workspaceMembershipState === "no_workspace" ? (
                   <div className="mt-5 rounded-3xl border border-amber-200 bg-gradient-to-b from-amber-50/70 to-white p-8 sm:p-10 shadow-sm text-center">
                     <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-amber-100 text-2xl text-amber-900 shadow-inner">
                       🏢
@@ -3173,6 +3296,18 @@ export default function Home() {
                         Retry
                       </button>
                     </div>
+                  </div>
+                ) : shiftLoadStatus === "forbidden" ? (
+                  <div className="mt-5 rounded-2xl border border-slate-200 bg-white p-8 text-center shadow-sm">
+                    <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-amber-100 text-xl text-amber-800">
+                      🔒
+                    </div>
+                    <h3 className="mt-3 text-base font-bold text-slate-900">
+                      Access Restricted
+                    </h3>
+                    <p className="mx-auto mt-1 max-w-md text-sm text-slate-600">
+                      {statusMessage || "You do not have permission to view this schedule. Contact your workspace administrator."}
+                    </p>
                   </div>
                 ) : schedule.length === 0 ? (
                   <p className="mt-5 rounded-xl border border-slate-200 bg-white p-6 text-sm text-slate-500">

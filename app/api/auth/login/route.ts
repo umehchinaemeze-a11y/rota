@@ -129,13 +129,35 @@ export async function handleLogin(
       ipAddress,
     });
 
+    // Resolve user's default workspace membership if one exists
+    let activeTeamId: number | null = null;
+    let activeTeamRole: string = user.role;
+    try {
+      const membershipRows = await sql`
+        SELECT team_id, role
+        FROM team_memberships
+        WHERE user_id = ${user.id}
+        ORDER BY is_default DESC, id ASC
+        LIMIT 1;
+      `;
+      if (membershipRows && membershipRows.length > 0 && typeof membershipRows[0].team_id === "number") {
+        activeTeamId = membershipRows[0].team_id;
+        if (typeof membershipRows[0].role === "string" && membershipRows[0].role.trim().length > 0) {
+          activeTeamRole = membershipRows[0].role.trim();
+        }
+      }
+    } catch {
+      // Allow login to succeed even if team_memberships lookup fails
+    }
+
     // Create session strictly with database-verified identity, ignoring any client role/ID claims
     const token = createSessionToken(
       {
         userId: user.id,
         email: user.email,
         name: user.name,
-        role: user.role,
+        role: activeTeamRole,
+        teamId: activeTeamId,
         sessionId: authSession.sessionId,
       },
       secret,
@@ -147,7 +169,8 @@ export async function handleLogin(
         id: user.id,
         email: user.email,
         name: user.name,
-        role: user.role,
+        role: activeTeamRole,
+        teamId: activeTeamId,
       },
       {
         status: 200,

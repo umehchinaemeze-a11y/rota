@@ -515,8 +515,90 @@ describe("Workspace Listing API Handler — GET /api/teams", () => {
 
     assert.equal(res.status, 500);
     const data = await res.json();
-    assert.equal(data.error, "Failed to list workspaces.");
+    assert.equal(data.error, "Unable to verify existing workspace memberships. Please try again.");
     assert.doesNotMatch(JSON.stringify(data), /secret_pw/);
     assert.doesNotMatch(JSON.stringify(data), /postgresql/);
+  });
+
+  it("returns HTTP 200 with empty array for confirmed unassigned user with zero memberships", async () => {
+    const user = {
+      userId: 99,
+      email: "newcomer@rota.local",
+      name: "Newcomer",
+      role: "Front Desk",
+      teamId: null,
+    };
+
+    const res = await handleGetTeams({
+      getSessionUser: async () => user,
+      sql: async () => [],
+    });
+
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    assert.ok(Array.isArray(data.teams));
+    assert.equal(data.teams.length, 0);
+  });
+
+  it("returns HTTP 401 when user session has invalid or missing userId", async () => {
+    const res = await handleGetTeams({
+      getSessionUser: async () => ({
+        userId: "invalid-id",
+        email: "test@rota.local",
+      }),
+      sql: async () => [],
+    });
+
+    assert.equal(res.status, 401);
+    const data = await res.json();
+    assert.match(data.error, /Invalid user session identity/);
+  });
+
+  it("returns multiple workspace memberships ordered with default team first", async () => {
+    const user = {
+      userId: 25,
+      email: "multirole@rota.local",
+      name: "Multi Role",
+      role: "Owner",
+      teamId: 2,
+    };
+
+    const mockTeams = [
+      { id: 2, name: "Default Clinic", slug: "default-clinic", role: "Owner", is_default: true },
+      { id: 1, name: "Branch East", slug: "branch-east", role: "Staff", is_default: false },
+      { id: 3, name: "Branch West", slug: "branch-west", role: "Supervisor", is_default: false },
+    ];
+
+    const res = await handleGetTeams({
+      getSessionUser: async () => user,
+      sql: async () => mockTeams,
+    });
+
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    assert.equal(data.teams.length, 3);
+    assert.equal(data.teams[0].id, 2);
+    assert.equal(data.teams[0].is_default, true);
+  });
+
+  it("security gate: fails closed and resets teamId to null if user has no database membership", async () => {
+    // Stale user token claiming teamId: 999
+    const staleUser = {
+      userId: 44,
+      email: "revoked@rota.local",
+      name: "Revoked Member",
+      role: "Owner",
+      teamId: 999,
+    };
+
+    // When querying database memberships, user has 0 rows
+    const res = await handleGetTeams({
+      getSessionUser: async () => staleUser,
+      sql: async () => [],
+    });
+
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    assert.equal(data.teams.length, 0); // Confirmed 0 memberships
   });
 });

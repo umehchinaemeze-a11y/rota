@@ -5,6 +5,7 @@ import {
   GOOGLE_AUTHORIZATION_ENDPOINT,
   buildGoogleAuthorizationUrl,
   getGoogleConfig,
+  isGoogleAuthAvailable,
   validateGoogleIdTokenClaims,
 } from "../lib/oauth/google.ts";
 import {
@@ -135,6 +136,39 @@ describe("Google OAuth configuration and authorization URL", () => {
     });
 
     assert.equal(config.redirectUri, "https://example.com/callback");
+  });
+
+  it("resolves VERCEL_PROJECT_PRODUCTION_URL fallback redirect URI when NEXT_PUBLIC_APP_URL is absent", () => {
+    const config = getGoogleConfig({
+      GOOGLE_CLIENT_ID: "id",
+      GOOGLE_CLIENT_SECRET: "secret",
+      VERCEL_PROJECT_PRODUCTION_URL: "rota-lovat-gamma.vercel.app",
+    });
+
+    assert.equal(config.redirectUri, "https://rota-lovat-gamma.vercel.app/api/auth/google/callback");
+  });
+
+  it("resolves canonical production redirect URI when NODE_ENV is production without explicit URL", () => {
+    const config = getGoogleConfig({
+      NODE_ENV: "production",
+      GOOGLE_CLIENT_ID: "id",
+      GOOGLE_CLIENT_SECRET: "secret",
+    });
+
+    assert.equal(config.redirectUri, "https://rota-lovat-gamma.vercel.app/api/auth/google/callback");
+  });
+
+  it("detects whether Google auth is available gracefully without throwing", () => {
+    assert.equal(isGoogleAuthAvailable({}), false);
+    assert.equal(isGoogleAuthAvailable({ GOOGLE_CLIENT_ID: "id" }), false);
+    assert.equal(
+      isGoogleAuthAvailable({
+        GOOGLE_CLIENT_ID: "id",
+        GOOGLE_CLIENT_SECRET: "secret",
+        GOOGLE_REDIRECT_URI: "https://example.com/callback",
+      }),
+      true
+    );
   });
 
   it("builds an authorization URL with PKCE S256, state, nonce, and openid scopes", () => {

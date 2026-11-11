@@ -124,7 +124,36 @@ async function completeLogin(
     ipAddress,
   });
 
-  const sessionCookie = createUserSessionCookie(user, secret, authSession.sessionId);
+  // Resolve user's default workspace membership if one exists
+  let activeTeamId: number | null = null;
+  let activeTeamRole: string = user.role;
+  try {
+    const membershipRows = (await executeSql`
+      SELECT team_id, role
+      FROM team_memberships
+      WHERE user_id = ${user.id}
+      ORDER BY is_default DESC, id ASC
+      LIMIT 1;
+    `) as Array<{ team_id?: unknown; role?: unknown }> | null | undefined;
+    if (membershipRows && membershipRows.length > 0 && typeof membershipRows[0].team_id === "number") {
+      activeTeamId = membershipRows[0].team_id;
+      if (typeof membershipRows[0].role === "string" && membershipRows[0].role.trim().length > 0) {
+        activeTeamRole = membershipRows[0].role.trim();
+      }
+    }
+  } catch {
+    // If team_memberships lookup fails, proceed with default role
+  }
+
+  const sessionCookie = createUserSessionCookie(
+    {
+      ...user,
+      role: activeTeamRole,
+      teamId: activeTeamId,
+    },
+    secret,
+    authSession.sessionId
+  );
   const refreshCookie = serializeRefreshCookie(authSession.refreshToken, undefined, request);
   return redirectWithSession(request, safelyRedirectAfter(tx), sessionCookie, refreshCookie);
 }

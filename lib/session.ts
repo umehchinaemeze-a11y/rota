@@ -129,8 +129,10 @@ export async function getSessionUser(options?: {
             activeTeamRole = teamRows[0].role.trim();
           }
         }
-      } catch {
-        // If team_memberships table does not exist yet or query fails, activeTeamId remains null
+      } catch (err) {
+        console.error("Failed to query team memberships in getSessionUser:", err);
+        // Security invariant: Fail closed. Never grant workspace access from an unverified or stale JWT payload.
+        // If DB verification fails, activeTeamId remains null so stale tokens cannot access team resources.
         activeTeamId = null;
         activeTeamRole = null;
       }

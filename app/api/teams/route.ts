@@ -60,13 +60,21 @@ export async function handleCreateTeam(
       );
     }
 
+    const userId = Number(sessionUser.userId);
+    if (!Number.isInteger(userId) || userId <= 0) {
+      return Response.json(
+        { error: "Invalid user session identity." },
+        { status: 401 }
+      );
+    }
+
     // 3. Gatekeeping: Reject users who already have any team membership
     let existingMemberships: any[] = [];
     try {
       existingMemberships = await executeSql`
         SELECT id, team_id
         FROM team_memberships
-        WHERE user_id = ${sessionUser.userId}
+        WHERE user_id = ${userId}
         LIMIT 1;
       `;
     } catch (membershipErr) {
@@ -149,7 +157,7 @@ export async function handleCreateTeam(
           ),
           new_membership AS (
             INSERT INTO team_memberships (user_id, team_id, role, is_default)
-            SELECT ${sessionUser.userId}, new_team.id, 'Owner', TRUE
+            SELECT ${userId}, new_team.id, 'Owner', TRUE
             FROM new_team
             RETURNING id, team_id, role
           )
@@ -291,6 +299,14 @@ export async function handleGetTeams(
       );
     }
 
+    const userId = Number(sessionUser.userId);
+    if (!Number.isInteger(userId) || userId <= 0) {
+      return Response.json(
+        { error: "Invalid user session identity." },
+        { status: 401 }
+      );
+    }
+
     const memberships = await executeSql`
       SELECT
         t.id,
@@ -300,17 +316,17 @@ export async function handleGetTeams(
         tm.is_default
       FROM teams t
       JOIN team_memberships tm ON tm.team_id = t.id
-      WHERE tm.user_id = ${sessionUser.userId}
+      WHERE tm.user_id = ${userId}
       ORDER BY tm.is_default DESC, t.name ASC;
     `;
 
     return Response.json({
       teams: memberships || [],
     });
-  } catch (error) {
-    console.error("Failed to list workspaces:", error);
+  } catch (error: any) {
+    console.error("Failed to list workspaces:", error?.message || error);
     return Response.json(
-      { error: "Failed to list workspaces." },
+      { error: "Unable to verify existing workspace memberships. Please try again." },
       { status: 500 }
     );
   }
