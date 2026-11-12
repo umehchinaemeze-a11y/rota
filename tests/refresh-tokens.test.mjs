@@ -30,6 +30,9 @@ import { handleLogin } from "../app/api/auth/login/route.ts";
 import { handleRegister } from "../app/api/auth/register/route.ts";
 import { handleRefresh } from "../app/api/auth/refresh/route.ts";
 import { handleLogout } from "../app/api/auth/logout/route.ts";
+import { handleLogoutAll } from "../app/api/auth/logout-all/route.ts";
+import * as logoutRoute from "../app/api/auth/logout/route.ts";
+import * as logoutAllRoute from "../app/api/auth/logout-all/route.ts";
 
 const TEST_SECRET = "test_auth_secret_0123456789abcdef0123456789abcdef";
 
@@ -590,6 +593,58 @@ describe("Logout Lifecycle (Current Device vs All Devices)", () => {
       (s) => s.user_id === 99 && s.revoked === false
     );
     assert.equal(otherActiveSessions.length, 1, "Other user's sessions must not be affected");
+  });
+
+  it("exports POST handler and does not export GET handler on logout route modules (CSRF hardening)", () => {
+    assert.equal(typeof logoutRoute.POST, "function", "app/api/auth/logout must export POST");
+    assert.equal(typeof logoutRoute.GET, "undefined", "app/api/auth/logout must not export GET");
+    assert.equal(typeof logoutAllRoute.POST, "function", "app/api/auth/logout-all must export POST");
+    assert.equal(typeof logoutAllRoute.GET, "undefined", "app/api/auth/logout-all must not export GET");
+  });
+
+  it("logs out from all devices via handleLogoutAll and preserves cookie-clearing behavior", async () => {
+    const db = createMockAuthDb([
+      { id: 14, email: "all-devices@rota.local", name: "All Devices User", role: "Staff" },
+      { id: 98, email: "keep@rota.local", name: "Keep Active User", role: "Staff" },
+    ]);
+
+    await createAuthSession(db.sql, { userId: 14, userAgent: "Phone" });
+    await createAuthSession(db.sql, { userId: 14, userAgent: "Laptop" });
+    await createAuthSession(db.sql, { userId: 98, userAgent: "Desktop" });
+
+    assert.equal(db.authSessions.filter((s) => !s.revoked).length, 3);
+
+    const req = new Request("http://localhost/api/auth/logout-all", {
+      method: "POST",
+    });
+
+    const res = await handleLogoutAll(req, {
+      sql: db.sql,
+      getSessionUser: async () => ({
+        userId: 14,
+        email: "all-devices@rota.local",
+        name: "All Devices User",
+        role: "Staff",
+        exp: Math.floor(Date.now() / 1000) + 900,
+      }),
+    });
+
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    assert.equal(data.success, true);
+    assert.ok(data.message.includes("all devices"));
+
+    // Verify all sessions of User 14 are revoked
+    const user14Active = db.authSessions.filter((s) => s.user_id === 14 && !s.revoked);
+    assert.equal(user14Active.length, 0, "All sessions of User 14 must be terminated");
+
+    // Verify other user's session remains active
+    const user98Active = db.authSessions.filter((s) => s.user_id === 98 && !s.revoked);
+    assert.equal(user98Active.length, 1, "Other user's session must not be revoked");
+
+    // Verify cookie clearing headers are present
+    const setCookie = res.headers.get("set-cookie") || "";
+    assert.ok(setCookie.includes("Max-Age=0"), "Set-Cookie headers must clear auth cookies");
   });
 });
 

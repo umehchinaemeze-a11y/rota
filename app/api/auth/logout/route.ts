@@ -133,6 +133,3 @@ export async function POST(request: Request) {
   return handleLogout(request);
 }
 
-export async function GET(request: Request) {
-  return handleLogout(request);
-}
