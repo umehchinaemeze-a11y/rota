@@ -65,6 +65,15 @@ function getInitials(name: string) {
     .toUpperCase();
 }
 
+function getDisplayRole(role?: string | null): "Owner" | "Manager" | "Supervisor" | "Staff" {
+  if (!role) return "Staff";
+  const r = role.toLowerCase().trim();
+  if (r === "owner") return "Owner";
+  if (r === "manager" || r === "operations" || r === "admin") return "Manager";
+  if (r === "supervisor") return "Supervisor";
+  return "Staff";
+}
+
 export default function Home() {
   const [activeTab, setActiveTab] = useState("Overview");
 
@@ -177,6 +186,29 @@ export default function Home() {
   const [upgradingPlan, setUpgradingPlan] = useState<boolean>(false);
   const [billingError, setBillingError] = useState<string>("");
 
+  // Main Navigation Drawer & Offline states
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [showSignOutDialog, setShowSignOutDialog] = useState(false);
+  const [showOrgSwitcher, setShowOrgSwitcher] = useState(false);
+  const [userWorkspaces, setUserWorkspaces] = useState<UserWorkspace[]>([]);
+  const [isOnline, setIsOnline] = useState<boolean>(() =>
+    typeof navigator !== "undefined" ? navigator.onLine : true
+  );
+  const drawerTouchStartXRef = useRef<number>(0);
+  const drawerTouchStartYRef = useRef<number>(0);
+  const showSignOutDialogRef = useRef<boolean>(false);
+  useEffect(() => {
+    showSignOutDialogRef.current = showSignOutDialog;
+  }, [showSignOutDialog]);
+  const drawerRef = useRef<HTMLElement | null>(null);
+  const drawerCloseButtonRef = useRef<HTMLButtonElement | null>(null);
+  const drawerSignOutButtonRef = useRef<HTMLButtonElement | null>(null);
+  const signOutDialogRef = useRef<HTMLDivElement | null>(null);
+  const cancelSignOutButtonRef = useRef<HTMLButtonElement | null>(null);
+  const previousFocusedElementRef = useRef<HTMLElement | null>(null);
+  const prevShowSignOutDialogRef = useRef<boolean>(false);
+  const isSigningOutRef = useRef<boolean>(false);
+
   // Schedule & team
   const [schedule, setSchedule] = useState<ScheduleShift[]>([]);
   const [team, setTeam] = useState([
@@ -268,6 +300,7 @@ export default function Home() {
       const data = await res.json().catch(() => null);
       const teamsList: UserWorkspace[] =
         data && Array.isArray(data.teams) ? data.teams : [];
+      setUserWorkspaces(teamsList);
 
       if (teamsList.length > 0) {
         setWorkspaceMembershipState("has_workspace");
@@ -748,11 +781,12 @@ export default function Home() {
   // Tab change handler that initiates activity feed loading when Activity tab is selected
   const handleTabSelect = useCallback(
     (tabName: string) => {
-      setActiveTab(tabName);
+      const resolvedTab = tabName === "Inbox" ? "Activity" : tabName;
+      setActiveTab(resolvedTab);
       setError("");
       setNotice("");
       if (
-        tabName === "Activity" &&
+        resolvedTab === "Activity" &&
         activityEvents.length === 0 &&
         !activityLoading &&
         !activityFetchingRef.current
@@ -762,6 +796,343 @@ export default function Home() {
     },
     [activityEvents.length, activityLoading, loadActivityFirstPage]
   );
+
+  const openDrawer = useCallback(() => {
+    setDrawerOpen(true);
+  }, []);
+
+  const closeDrawer = useCallback(() => {
+    setDrawerOpen(false);
+    setShowOrgSwitcher(false);
+    setShowSignOutDialog(false);
+    if (typeof window !== "undefined" && window.history.state?.rotaDrawer) {
+      window.history.back();
+    }
+  }, []);
+
+  const handleDrawerTouchStart = (e: React.TouchEvent) => {
+    if (e.touches.length === 1) {
+      drawerTouchStartXRef.current = e.touches[0].clientX;
+      drawerTouchStartYRef.current = e.touches[0].clientY;
+    }
+  };
+
+  const handleDrawerTouchEnd = (e: React.TouchEvent) => {
+    if (e.changedTouches.length === 1) {
+      const deltaX = e.changedTouches[0].clientX - drawerTouchStartXRef.current;
+      const deltaY = e.changedTouches[0].clientY - drawerTouchStartYRef.current;
+
+      // Swiping left to close
+      if (deltaX <= -50 && Math.abs(deltaY) < 50) {
+        closeDrawer();
+      }
+    }
+  };
+
+  // Online / offline network detection
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, []);
+
+  // Left screen edge swipe-to-open gesture
+  useEffect(() => {
+    let touchStartX = 0;
+    let touchStartY = 0;
+    let touchStartTime = 0;
+
+    const handleWindowTouchStart = (e: TouchEvent) => {
+      if (e.touches.length === 1) {
+        touchStartX = e.touches[0].clientX;
+        touchStartY = e.touches[0].clientY;
+        touchStartTime = Date.now();
+      }
+    };
+
+    const handleWindowTouchEnd = (e: TouchEvent) => {
+      if (e.changedTouches.length === 1) {
+        const deltaX = e.changedTouches[0].clientX - touchStartX;
+        const deltaY = e.changedTouches[0].clientY - touchStartY;
+        const duration = Date.now() - touchStartTime;
+
+        // Swiping right from left edge (within 40px of edge, deltaX >= 50px, horizontal gesture within 500ms)
+        if (touchStartX <= 40 && deltaX >= 50 && Math.abs(deltaY) < 50 && duration < 500) {
+          openDrawer();
+        }
+      }
+    };
+
+    window.addEventListener("touchstart", handleWindowTouchStart, { passive: true });
+    window.addEventListener("touchend", handleWindowTouchEnd, { passive: true });
+
+    return () => {
+      window.removeEventListener("touchstart", handleWindowTouchStart);
+      window.removeEventListener("touchend", handleWindowTouchEnd);
+    };
+  }, [openDrawer]);
+
+  // Drawer modal interactions: body scroll lock, Escape key, and Android back button (popstate)
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    if (drawerOpen) {
+      const originalOverflow = document.body.style.overflow;
+      document.body.style.overflow = "hidden";
+      return () => {
+        document.body.style.overflow = originalOverflow;
+      };
+    }
+  }, [drawerOpen]);
+
+  // Focus management: move focus into drawer on open and restore on close
+  useEffect(() => {
+    if (!drawerOpen) {
+      if (
+        previousFocusedElementRef.current &&
+        typeof previousFocusedElementRef.current.focus === "function"
+      ) {
+        previousFocusedElementRef.current.focus();
+        previousFocusedElementRef.current = null;
+      }
+      return;
+    }
+
+    previousFocusedElementRef.current = document.activeElement as HTMLElement | null;
+
+    const frameId = requestAnimationFrame(() => {
+      if (drawerCloseButtonRef.current) {
+        drawerCloseButtonRef.current.focus();
+      } else if (drawerRef.current) {
+        drawerRef.current.focus();
+      }
+    });
+
+    return () => {
+      cancelAnimationFrame(frameId);
+    };
+  }, [drawerOpen]);
+
+  // Focus management: move focus into sign-out dialog on open and restore to drawer on dismiss
+  useEffect(() => {
+    if (showSignOutDialog) {
+      prevShowSignOutDialogRef.current = true;
+      const frameId = requestAnimationFrame(() => {
+        if (cancelSignOutButtonRef.current) {
+          cancelSignOutButtonRef.current.focus();
+        } else if (signOutDialogRef.current) {
+          signOutDialogRef.current.focus();
+        }
+      });
+      return () => cancelAnimationFrame(frameId);
+    } else if (prevShowSignOutDialogRef.current) {
+      prevShowSignOutDialogRef.current = false;
+      if (drawerOpen && !isSigningOutRef.current) {
+        requestAnimationFrame(() => {
+          drawerSignOutButtonRef.current?.focus();
+        });
+      }
+    }
+  }, [showSignOutDialog, drawerOpen]);
+
+  useEffect(() => {
+    if (!drawerOpen) return;
+
+    // Push state for Android back button navigation if not already set
+    if (typeof window !== "undefined" && !window.history.state?.rotaDrawer) {
+      window.history.pushState({ rotaDrawer: true }, "");
+    }
+
+    const handlePopState = () => {
+      setShowSignOutDialog(false);
+      setDrawerOpen(false);
+      setShowOrgSwitcher(false);
+    };
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (showSignOutDialogRef.current) {
+          setShowSignOutDialog(false);
+          return;
+        }
+        closeDrawer();
+        return;
+      }
+
+      if (e.key === "Tab") {
+        if (showSignOutDialogRef.current) {
+          if (!signOutDialogRef.current) return;
+
+          const allDialogFocusable = Array.from(
+            signOutDialogRef.current.querySelectorAll<HTMLElement>(
+              'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+            )
+          );
+          const focusableInDialog = allDialogFocusable.filter(
+            (el) =>
+              el.offsetParent !== null ||
+              el.offsetWidth > 0 ||
+              el.offsetHeight > 0 ||
+              (typeof el.getClientRects === "function" && el.getClientRects().length > 0)
+          );
+          const activeDialogFocusable =
+            focusableInDialog.length > 0 ? focusableInDialog : allDialogFocusable;
+
+          if (activeDialogFocusable.length === 0) {
+            e.preventDefault();
+            return;
+          }
+
+          const firstDialogElement = activeDialogFocusable[0];
+          const lastDialogElement =
+            activeDialogFocusable[activeDialogFocusable.length - 1];
+
+          if (e.shiftKey) {
+            if (
+              document.activeElement === firstDialogElement ||
+              !signOutDialogRef.current.contains(document.activeElement)
+            ) {
+              e.preventDefault();
+              lastDialogElement.focus();
+            }
+          } else {
+            if (
+              document.activeElement === lastDialogElement ||
+              !signOutDialogRef.current.contains(document.activeElement)
+            ) {
+              e.preventDefault();
+              firstDialogElement.focus();
+            }
+          }
+          return;
+        }
+
+        if (!drawerRef.current) return;
+
+        const allDrawerFocusable = Array.from(
+          drawerRef.current.querySelectorAll<HTMLElement>(
+            'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+          )
+        );
+        const focusableElements = allDrawerFocusable.filter(
+          (el) =>
+            el.offsetParent !== null ||
+            el.offsetWidth > 0 ||
+            el.offsetHeight > 0 ||
+            (typeof el.getClientRects === "function" && el.getClientRects().length > 0)
+        );
+        const activeDrawerFocusable =
+          focusableElements.length > 0 ? focusableElements : allDrawerFocusable;
+
+        if (activeDrawerFocusable.length === 0) {
+          e.preventDefault();
+          return;
+        }
+
+        const firstElement = activeDrawerFocusable[0];
+        const lastElement =
+          activeDrawerFocusable[activeDrawerFocusable.length - 1];
+
+        if (e.shiftKey) {
+          if (
+            document.activeElement === firstElement ||
+            !drawerRef.current.contains(document.activeElement)
+          ) {
+            e.preventDefault();
+            lastElement.focus();
+          }
+        } else {
+          if (
+            document.activeElement === lastElement ||
+            !drawerRef.current.contains(document.activeElement)
+          ) {
+            e.preventDefault();
+            firstElement.focus();
+          }
+        }
+      }
+    };
+
+    window.addEventListener("popstate", handlePopState);
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      window.removeEventListener("popstate", handlePopState);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [drawerOpen, closeDrawer]);
+
+  // Capacitor back-button handler (Android mobile wrapper)
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const win = window as unknown as {
+      Capacitor?: {
+        Plugins?: {
+          App?: {
+            addListener: (
+              eventName: string,
+              listener: (data: { canGoBack?: boolean }) => void
+            ) => Promise<{ remove: () => void }>;
+          };
+        };
+      };
+    };
+
+    if (!win.Capacitor?.Plugins?.App?.addListener) return;
+
+    let isMounted = true;
+    let listenerHandle: { remove: () => void } | null = null;
+
+    try {
+      const registrationPromise = win.Capacitor.Plugins.App.addListener(
+        "backButton",
+        (data: { canGoBack?: boolean }) => {
+          if (drawerOpen) {
+            closeDrawer();
+          } else if (data?.canGoBack) {
+            window.history.back();
+          }
+        }
+      );
+
+      if (registrationPromise && typeof registrationPromise.then === "function") {
+        registrationPromise
+          .then((handle: { remove: () => void }) => {
+            if (!isMounted) {
+              try {
+                handle?.remove();
+              } catch {
+                // Ignore removal error safely
+              }
+            } else {
+              listenerHandle = handle;
+            }
+          })
+          .catch(() => {
+            // Handle registration errors safely without breaking web navigation
+          });
+      }
+    } catch {
+      // Handle synchronous plugin invocation errors safely
+    }
+
+    return () => {
+      isMounted = false;
+      if (listenerHandle) {
+        try {
+          listenerHandle.remove();
+        } catch {
+          // Ignore removal error safely
+        }
+        listenerHandle = null;
+      }
+    };
+  }, [drawerOpen, closeDrawer]);
 
   // IntersectionObserver for infinite scrolling sentinel
   useEffect(() => {
@@ -798,6 +1169,7 @@ export default function Home() {
           if (!active) return;
 
           if (verifiedTeams && verifiedTeams.length > 0) {
+            setUserWorkspaces(verifiedTeams);
             await loadShifts();
             if (!active) return;
 
@@ -1024,6 +1396,9 @@ export default function Home() {
       setRecoverableShifts([]);
       setSubscriptionPlan("free");
       setSubscriptionSeats(5);
+      setUserWorkspaces([]);
+      setDrawerOpen(false);
+      setShowOrgSwitcher(false);
       setNotice(
         allDevices
           ? "You have been signed out from all devices."
@@ -1767,6 +2142,16 @@ export default function Home() {
 
   const isManager = isManagerRole(currentUser?.role);
 
+  const activeWorkspace = currentUser?.teamId
+    ? userWorkspaces.find((w) => w.id === currentUser.teamId)
+    : undefined;
+  const isOwnerOfActiveOrg = Boolean(
+    activeWorkspace?.role && getDisplayRole(activeWorkspace.role) === "Owner"
+  );
+  const activeOrgRoleBadge = activeWorkspace?.role
+    ? getDisplayRole(activeWorkspace.role)
+    : "Unknown";
+
   return (
     <main className="min-h-screen bg-[#f7f8f5] text-slate-900">
       <div className="mx-auto flex min-h-screen max-w-[1440px]">
@@ -1856,27 +2241,37 @@ export default function Home() {
         <section className="min-w-0 flex-1 flex flex-col">
           {/* Mobile Top Brand Bar */}
           <div className="flex items-center justify-between border-b border-slate-200 bg-white px-5 py-3 md:hidden">
-            <div className="flex items-center gap-2.5">
-              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-lime-300 text-base font-black text-slate-950 shadow-2xs">
-                R
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={openDrawer}
+                className="flex h-9 w-9 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 transition shadow-xs focus:outline-hidden focus:ring-2 focus:ring-lime-400"
+                aria-label="Open navigation menu"
+                aria-expanded={drawerOpen}
+              >
+                <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+                </svg>
+              </button>
+              <div className="flex items-center gap-2.5">
+                <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-lime-300 text-base font-black text-slate-950 shadow-2xs">
+                  R
+                </div>
+                <span className="text-lg font-bold tracking-tight text-slate-950">
+                  rota<span className="text-lime-600">.</span>
+                </span>
               </div>
-              <span className="text-lg font-bold tracking-tight text-slate-950">
-                rota<span className="text-lime-600">.</span>
-              </span>
             </div>
             <div className="flex items-center gap-2">
               {currentUser ? (
-                <div className="flex items-center gap-2">
-                  <div className="flex h-7 w-7 items-center justify-center rounded-full bg-slate-900 text-xs font-bold text-white">
-                    {getInitials(currentUser.name)}
-                  </div>
-                  <button
-                    onClick={() => handleLogout(false)}
-                    className="rounded-lg border border-slate-300 bg-white px-2 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-100"
-                  >
-                    Sign out
-                  </button>
-                </div>
+                <button
+                  type="button"
+                  onClick={openDrawer}
+                  className="flex h-8 w-8 items-center justify-center rounded-full bg-slate-900 text-xs font-bold text-white hover:ring-2 hover:ring-lime-400 transition"
+                  aria-label="Open profile drawer"
+                >
+                  {getInitials(currentUser.name)}
+                </button>
               ) : (
                 <button
                   onClick={() => setShowLoginModal(true)}
@@ -1913,11 +2308,24 @@ export default function Home() {
           </div>
 
           <header className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-200 bg-white px-5 py-5 sm:px-8">
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">
-                WORKSPACE / ROTA
-              </p>
-              <h1 className="mt-1 text-xl font-bold sm:text-2xl text-slate-900">{activeTab}</h1>
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={openDrawer}
+                className="flex h-10 w-10 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 transition shadow-xs focus:outline-hidden focus:ring-2 focus:ring-lime-400"
+                aria-label="Open navigation menu"
+                aria-expanded={drawerOpen}
+              >
+                <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+                </svg>
+              </button>
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">
+                  WORKSPACE / ROTA
+                </p>
+                <h1 className="mt-1 text-xl font-bold sm:text-2xl text-slate-900">{activeTab}</h1>
+              </div>
             </div>
 
             <div className="flex flex-wrap items-center gap-3">
@@ -1927,7 +2335,12 @@ export default function Home() {
                   Checking session…
                 </div>
               ) : currentUser ? (
-                <div className="flex items-center gap-3 rounded-xl border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs">
+                <button
+                  type="button"
+                  onClick={openDrawer}
+                  className="flex items-center gap-3 rounded-xl border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs hover:bg-slate-100 transition text-left focus:outline-hidden focus:ring-2 focus:ring-lime-400"
+                  aria-label="Open navigation drawer"
+                >
                   <div className="flex h-7 w-7 items-center justify-center rounded-full bg-slate-900 text-xs font-bold text-white">
                     {getInitials(currentUser.name)}
                   </div>
@@ -1937,13 +2350,7 @@ export default function Home() {
                       {currentUser.role}
                     </p>
                   </div>
-                  <button
-                    onClick={() => handleLogout(false)}
-                    className="ml-2 rounded-lg border border-slate-300 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-100"
-                  >
-                    Sign out
-                  </button>
-                </div>
+                </button>
               ) : (
                 <button
                   onClick={() => setShowLoginModal(true)}
@@ -2854,22 +3261,13 @@ export default function Home() {
 
                     <div className="mt-6 flex flex-wrap items-center justify-end gap-3">
                       {currentUser && (
-                        <>
-                          <button
-                            type="button"
-                            onClick={() => handleLogout(false)}
-                            className="rounded-xl border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 transition"
-                          >
-                            Sign Out (This Device)
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleLogout(true)}
-                            className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-2 text-xs font-semibold text-rose-700 hover:bg-rose-100 transition"
-                          >
-                            Sign Out of All Devices
-                          </button>
-                        </>
+                        <button
+                          type="button"
+                          onClick={() => handleLogout(true)}
+                          className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-2 text-xs font-semibold text-rose-700 hover:bg-rose-100 transition"
+                        >
+                          Sign Out of All Devices
+                        </button>
                       )}
                     </div>
                   </div>
@@ -4319,6 +4717,295 @@ export default function Home() {
                 className="font-medium text-slate-600 hover:text-slate-900"
               >
                 Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* MAIN NAVIGATION DRAWER & SIGN-OUT CONFIRMATION DIALOG                     */}
+      {/* ========================================================================= */}
+
+      {/* Backdrop */}
+      {drawerOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-slate-950/40 backdrop-blur-xs transition-opacity duration-300"
+          onClick={closeDrawer}
+          aria-hidden="true"
+        />
+      )}
+
+      {/* Drawer Panel */}
+      <aside
+        ref={drawerRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Main navigation drawer"
+        aria-hidden={!drawerOpen || showSignOutDialog}
+        inert={!drawerOpen || showSignOutDialog}
+        tabIndex={-1}
+        onTouchStart={handleDrawerTouchStart}
+        onTouchEnd={handleDrawerTouchEnd}
+        className={`fixed top-0 bottom-0 left-0 z-50 flex w-80 max-w-[85vw] sm:w-96 flex-col bg-white shadow-2xl transition-transform duration-300 ease-in-out ${
+          drawerOpen
+            ? "translate-x-0 visible opacity-100"
+            : "-translate-x-full invisible opacity-0 pointer-events-none"
+        }`}
+      >
+        {/* 1. Profile card at the top */}
+        <div className="p-5 border-b border-slate-200 bg-slate-50/70">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-center gap-3 min-w-0">
+              <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-slate-900 text-sm font-bold text-white shadow-xs">
+                {currentUser ? getInitials(currentUser.name) : "RO"}
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="truncate font-bold text-slate-900 text-sm">
+                  {currentUser ? currentUser.name : "Guest User"}
+                </p>
+                <p className="truncate text-xs text-slate-500">
+                  {currentUser ? currentUser.email : "Not signed in"}
+                </p>
+              </div>
+            </div>
+            <button
+              ref={drawerCloseButtonRef}
+              type="button"
+              onClick={closeDrawer}
+              className="rounded-xl p-1.5 text-slate-400 hover:text-slate-700 hover:bg-slate-200/60 transition focus:outline-hidden focus:ring-2 focus:ring-lime-400"
+              aria-label="Close drawer"
+            >
+              <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+
+          {/* Active Organisation & Role Badge */}
+          <div className="mt-3.5 flex items-center justify-between gap-2 border-t border-slate-200/80 pt-3">
+            <div className="min-w-0 flex-1">
+              <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                Organisation
+              </p>
+              <p className="truncate text-xs font-semibold text-slate-800">
+                {activeWorkspace?.name ||
+                  (currentUser?.teamId ? `Organisation #${currentUser.teamId}` : "Rota Workspace")}
+              </p>
+            </div>
+            <span className="shrink-0 rounded-full bg-lime-100 px-2.5 py-0.5 text-[11px] font-bold text-lime-900 border border-lime-200">
+              {activeOrgRoleBadge}
+            </span>
+          </div>
+
+          {/* Connection status (SHOW ONLY INSIDE THIS PROFILE CARD) */}
+          <div className="mt-2.5 flex items-center gap-2 pt-1">
+            {isOnline && !isOfflineSchedule ? (
+              <span className="flex items-center gap-1.5 text-emerald-700 font-medium text-[11px]">
+                <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
+                <span>Connected · Online</span>
+              </span>
+            ) : (
+              <span className="flex items-center gap-1.5 text-slate-500 font-medium text-[11px]">
+                <span className="h-2 w-2 rounded-full bg-slate-400" />
+                <span>Offline</span>
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* 2. Navigation items & 3. Workspace Section */}
+        <div className="flex-1 overflow-y-auto px-3 py-4 space-y-5">
+          <nav className="space-y-1">
+            {[
+              { name: "Schedule", icon: "▦", target: "Schedule" },
+              { name: "Inbox", icon: "📋", target: "Activity", unread: unreadNotificationsCount },
+              { name: "Team", icon: "♙", target: "Team" },
+              { name: "Settings", icon: "⚙", target: "Settings" },
+            ].map((item) => {
+              const isActive =
+                activeTab === item.target ||
+                (item.name === "Inbox" && (activeTab === "Activity" || activeTab === "Inbox"));
+              return (
+                <button
+                  key={item.name}
+                  type="button"
+                  onClick={() => {
+                    handleTabSelect(item.target);
+                    closeDrawer();
+                  }}
+                  className={`w-full rounded-xl px-3.5 py-2.5 text-left text-sm font-medium transition flex items-center justify-between ${
+                    isActive
+                      ? "bg-lime-200 text-slate-950 font-bold shadow-2xs"
+                      : "text-slate-700 hover:bg-slate-100"
+                  }`}
+                >
+                  <span className="flex items-center gap-3">
+                    <span className="text-base select-none">{item.icon}</span>
+                    <span>{item.name}</span>
+                  </span>
+                  {item.name === "Inbox" && typeof item.unread === "number" && item.unread > 0 && (
+                    <span className="rounded-full bg-rose-600 px-2 py-0.5 text-[10px] font-bold text-white shadow-2xs">
+                      {item.unread > 9 ? "9+" : item.unread}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </nav>
+
+          {/* 3. Workspace section (Role-based visibility: Owner only) */}
+          {isOwnerOfActiveOrg && (
+            <div className="pt-4 border-t border-slate-200">
+              <p className="px-3.5 mb-2 text-xs font-semibold uppercase tracking-wider text-slate-400">
+                Workspace
+              </p>
+              <div className="space-y-1">
+                {/* Switch organisation */}
+                <button
+                  type="button"
+                  onClick={() => setShowOrgSwitcher(!showOrgSwitcher)}
+                  className="w-full rounded-xl px-3.5 py-2.5 text-left text-sm font-medium text-slate-700 hover:bg-slate-100 transition flex items-center justify-between"
+                >
+                  <span className="flex items-center gap-3">
+                    <span className="text-base select-none">🏢</span>
+                    <span>Switch organisation</span>
+                  </span>
+                  <span className="text-xs text-slate-400">
+                    {showOrgSwitcher ? "▲" : "▼"}
+                  </span>
+                </button>
+
+                {/* Inline Organisation Switcher List */}
+                {showOrgSwitcher && userWorkspaces.length > 0 && (
+                  <div className="mx-2 p-1.5 rounded-xl bg-slate-50 border border-slate-200 space-y-1">
+                    {userWorkspaces.map((ws) => (
+                      <button
+                        key={ws.id}
+                        type="button"
+                        onClick={async () => {
+                          if (currentUser && ws.id !== currentUser.teamId) {
+                            setCurrentUser({
+                              ...currentUser,
+                              teamId: ws.id,
+                              role: ws.role,
+                            });
+                            await loadShifts();
+                            await loadBillingStatus({
+                              ...currentUser,
+                              teamId: ws.id,
+                              role: ws.role,
+                            });
+                          }
+                          setShowOrgSwitcher(false);
+                          closeDrawer();
+                        }}
+                        className={`w-full rounded-lg px-2.5 py-2 text-left text-xs transition flex items-center justify-between ${
+                          currentUser?.teamId === ws.id
+                            ? "bg-lime-200 font-bold text-slate-950"
+                            : "text-slate-600 hover:bg-slate-100"
+                        }`}
+                      >
+                        <span className="truncate">{ws.name}</span>
+                        <span className="text-[10px] text-slate-500 uppercase font-semibold">
+                          {ws.role}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {/* Subscription */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setBillingError("");
+                    setShowBillingModal(true);
+                    loadBillingStatus();
+                    closeDrawer();
+                  }}
+                  className="w-full rounded-xl px-3.5 py-2.5 text-left text-sm font-medium text-slate-700 hover:bg-slate-100 transition flex items-center justify-between"
+                >
+                  <span className="flex items-center gap-3">
+                    <span className="text-base select-none">💳</span>
+                    <span>Subscription</span>
+                  </span>
+                  <span className="text-[11px] font-semibold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200 capitalize">
+                    {subscriptionPlan}
+                  </span>
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* 4. Sign-out placement at the bottom of the drawer */}
+        {currentUser && (
+          <div className="p-4 border-t border-slate-200 bg-slate-50/50 mt-auto">
+            <button
+              ref={drawerSignOutButtonRef}
+              type="button"
+              onClick={() => {
+                isSigningOutRef.current = false;
+                setShowSignOutDialog(true);
+              }}
+              className="w-full rounded-xl px-4 py-3 text-left text-sm font-semibold text-rose-600 hover:bg-rose-50 hover:text-rose-700 transition flex items-center gap-3 focus:outline-hidden focus:ring-2 focus:ring-rose-400"
+            >
+              <span className="text-base select-none">🚪</span>
+              <span>Sign out</span>
+            </button>
+          </div>
+        )}
+      </aside>
+
+      {/* 5. Sign-out confirmation dialog */}
+      {showSignOutDialog && (
+        <div
+          ref={signOutDialogRef}
+          className="fixed inset-0 z-60 flex items-center justify-center p-4 bg-slate-950/50 backdrop-blur-xs"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="signout-dialog-title"
+          tabIndex={-1}
+        >
+          <div className="w-full max-w-sm rounded-2xl bg-white p-6 shadow-2xl border border-slate-200">
+            <h3 id="signout-dialog-title" className="text-lg font-bold text-slate-900">
+              Sign out of Rota?
+            </h3>
+            <p className="mt-2 text-xs text-slate-600 leading-relaxed">
+              Are you sure you want to sign out of your account on this device?
+            </p>
+
+            {/* Offline warning if offline */}
+            {(!isOnline || isOfflineSchedule || !!offlineTimestamp) && (
+              <div className="mt-3.5 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900 flex items-start gap-2">
+                <span className="text-sm select-none">⚠️</span>
+                <div className="text-[11px] leading-relaxed">
+                  <strong className="font-semibold">You are currently offline.</strong> Locally stored session and cached data will be cleared, and you will require an active internet connection to sign back in.
+                </div>
+              </div>
+            )}
+
+            <div className="mt-6 flex items-center justify-end gap-3">
+              <button
+                ref={cancelSignOutButtonRef}
+                type="button"
+                onClick={() => setShowSignOutDialog(false)}
+                className="rounded-xl border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 transition"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  isSigningOutRef.current = true;
+                  setShowSignOutDialog(false);
+                  closeDrawer();
+                  await handleLogout(false);
+                }}
+                className="rounded-xl bg-rose-600 px-4 py-2 text-xs font-semibold text-white hover:bg-rose-700 transition shadow-xs"
+              >
+                Sign out
               </button>
             </div>
           </div>
