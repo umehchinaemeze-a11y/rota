@@ -745,12 +745,23 @@ export default function Home() {
     }
   }, [activityCursor, activityHasMore, activityLoading, activityLoadingMore, activityRefreshing]);
 
-  // Load first page when Activity tab becomes active
-  useEffect(() => {
-    if (activeTab === "Activity" && activityEvents.length === 0 && !activityLoading) {
-      loadActivityFirstPage(false);
-    }
-  }, [activeTab, activityEvents.length, activityLoading, loadActivityFirstPage]);
+  // Tab change handler that initiates activity feed loading when Activity tab is selected
+  const handleTabSelect = useCallback(
+    (tabName: string) => {
+      setActiveTab(tabName);
+      setError("");
+      setNotice("");
+      if (
+        tabName === "Activity" &&
+        activityEvents.length === 0 &&
+        !activityLoading &&
+        !activityFetchingRef.current
+      ) {
+        void loadActivityFirstPage(false);
+      }
+    },
+    [activityEvents.length, activityLoading, loadActivityFirstPage]
+  );
 
   // IntersectionObserver for infinite scrolling sentinel
   useEffect(() => {
@@ -814,6 +825,14 @@ export default function Home() {
             const tabParam = params.get("tab");
             if (tabParam && ["Overview", "Schedule", "Activity", "Team", "Settings"].includes(tabParam)) {
               setActiveTab(tabParam);
+              if (
+                tabParam === "Activity" &&
+                activityEvents.length === 0 &&
+                !activityLoading &&
+                !activityFetchingRef.current
+              ) {
+                void loadActivityFirstPage(false);
+              }
             }
             const pstkRef = params.get("reference") || params.get("trxref");
             const pstkStatus = params.get("status");
@@ -1561,9 +1580,23 @@ export default function Home() {
       // Ignore
     }
 
-    if (notif.deepLink) {
-      if (typeof window !== "undefined") {
-        window.location.href = notif.deepLink;
+    if (notif.deepLink && typeof window !== "undefined") {
+      const target = notif.deepLink.trim();
+      // Ensure target is a relative same-origin path and not an external redirect or protocol-relative URL
+      if (
+        target.startsWith("/") &&
+        !target.startsWith("//") &&
+        !target.includes("\\") &&
+        !/[\r\n]/.test(target)
+      ) {
+        try {
+          const parsed = new URL(target, window.location.origin);
+          if (parsed.origin === window.location.origin) {
+            window.location.assign(parsed.pathname + parsed.search + parsed.hash);
+          }
+        } catch {
+          // Invalid path format: suppress navigation safely
+        }
       }
     }
   }
@@ -1764,11 +1797,7 @@ export default function Home() {
             ].map((tab) => (
               <button
                 key={tab.name}
-                onClick={() => {
-                  setActiveTab(tab.name);
-                  setError("");
-                  setNotice("");
-                }}
+                onClick={() => handleTabSelect(tab.name)}
                 className={`w-full rounded-xl px-4 py-3 text-left text-sm font-medium transition flex items-center justify-between ${
                   activeTab === tab.name
                     ? "bg-lime-200 text-slate-950 font-bold shadow-2xs"
@@ -1870,11 +1899,7 @@ export default function Home() {
             ].map((tab) => (
               <button
                 key={tab.name}
-                onClick={() => {
-                  setActiveTab(tab.name);
-                  setError("");
-                  setNotice("");
-                }}
+                onClick={() => handleTabSelect(tab.name)}
                 className={`shrink-0 rounded-xl px-3.5 py-2 text-xs font-medium transition flex items-center gap-1.5 ${
                   activeTab === tab.name
                     ? "bg-lime-200 text-slate-950 font-bold shadow-2xs"

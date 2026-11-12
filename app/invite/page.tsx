@@ -24,20 +24,38 @@ function InvitationContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const token = searchParams.get("token");
+  const hasToken = typeof token === "string" && token.trim().length > 0;
 
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(hasToken);
+  const [error, setError] = useState(
+    hasToken ? "" : "No invitation token was provided in the link."
+  );
   const [invitation, setInvitation] = useState<InvitationData | null>(null);
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
   const [accepting, setAccepting] = useState(false);
   const [successMessage, setSuccessMessage] = useState("");
+  const [prevToken, setPrevToken] = useState(token);
+
+  // If token changes while component remains mounted, synchronize state cleanly during render
+  if (token !== prevToken) {
+    setPrevToken(token);
+    if (!hasToken) {
+      setLoading(false);
+      setError("No invitation token was provided in the link.");
+      setInvitation(null);
+    } else {
+      setLoading(true);
+      setError("");
+      setInvitation(null);
+    }
+  }
 
   useEffect(() => {
-    if (!token) {
-      setError("No invitation token was provided in the link.");
-      setLoading(false);
+    if (!hasToken) {
       return;
     }
+
+    let active = true;
 
     async function loadData() {
       try {
@@ -46,6 +64,7 @@ function InvitationContent() {
           `/api/teams/invitations?token=${encodeURIComponent(token!)}`
         );
         const inviteData = await inviteRes.json();
+        if (!active) return;
 
         if (!inviteRes.ok || !inviteData.valid) {
           setError(inviteData.error || "This invitation link is invalid or has expired.");
@@ -60,22 +79,30 @@ function InvitationContent() {
           const authRes = await fetch("/api/auth/me");
           if (authRes.ok) {
             const authData = await authRes.json();
-            if (authData.user) {
+            if (active && authData.user) {
               setCurrentUser(authData.user);
             }
           }
         } catch {
           // Unauthenticated or network issue
         }
-      } catch (err) {
-        setError("Unable to verify invitation. Please check your internet connection.");
+      } catch {
+        if (active) {
+          setError("Unable to verify invitation. Please check your internet connection.");
+        }
       } finally {
-        setLoading(false);
+        if (active) {
+          setLoading(false);
+        }
       }
     }
 
     loadData();
-  }, [token]);
+
+    return () => {
+      active = false;
+    };
+  }, [hasToken, token]);
 
   async function handleAccept() {
     if (!token || accepting) return;
