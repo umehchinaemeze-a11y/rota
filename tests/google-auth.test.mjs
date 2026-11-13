@@ -275,18 +275,334 @@ describe("OAuth redirect and cookie safety", () => {
     assert.equal(sanitizeRedirectPath(`/${"a".repeat(501)}`), "/");
   });
 
-  it("checks request origin while allowing non-browser requests without Origin", () => {
-    const same = new Request("http://localhost/api/auth/google/link", {
+  it("validates request origin and referer against allowlist and fails closed", () => {
+    // 1. Canonical production Origin accepted
+    const prodReq = new Request("https://rota-lovat-gamma.vercel.app/api/auth/google/link", {
+      headers: { origin: "https://rota-lovat-gamma.vercel.app" },
+    });
+    assert.equal(isSameOriginRequest(prodReq), true);
+
+    // 2. Localhost Origin accepted in development/test
+    const localReq = new Request("http://localhost/api/auth/google/link", {
       headers: { origin: "http://localhost" },
     });
-    const cross = new Request("http://localhost/api/auth/google/link", {
+    assert.equal(isSameOriginRequest(localReq), true);
+
+    const localPortReq = new Request("http://localhost:3000/api/auth/google/link", {
+      headers: { origin: "http://localhost:3000" },
+    });
+    assert.equal(isSameOriginRequest(localPortReq), true);
+
+    // 3. Valid Referer fallback accepted when Origin is absent
+    const refererReq = new Request("http://localhost/api/auth/google/link", {
+      headers: { referer: "http://localhost/settings" },
+    });
+    assert.equal(isSameOriginRequest(refererReq), true);
+
+    const prodRefererReq = new Request("https://rota-lovat-gamma.vercel.app/api/auth/google/link", {
+      headers: { referer: "https://rota-lovat-gamma.vercel.app/account" },
+    });
+    assert.equal(isSameOriginRequest(prodRefererReq), true);
+
+    // 4. Cross-origin Origin rejected
+    const crossOriginReq = new Request("http://localhost/api/auth/google/link", {
       headers: { origin: "https://evil.example" },
     });
-    const noOrigin = new Request("http://localhost/api/auth/google/link");
+    assert.equal(isSameOriginRequest(crossOriginReq), false);
 
-    assert.equal(isSameOriginRequest(same), true);
-    assert.equal(isSameOriginRequest(cross), false);
-    assert.equal(isSameOriginRequest(noOrigin), true);
+    // 5. Cross-origin Referer rejected when Origin is absent
+    const crossRefererReq = new Request("http://localhost/api/auth/google/link", {
+      headers: { referer: "https://evil.example/settings" },
+    });
+    assert.equal(isSameOriginRequest(crossRefererReq), false);
+
+    // 6. Malformed Origin rejected immediately
+    const malformedOriginReq = new Request("http://localhost/api/auth/google/link", {
+      headers: { origin: "not-a-valid-url" },
+    });
+    assert.equal(isSameOriginRequest(malformedOriginReq), false);
+
+    // 7. Malformed Referer rejected when Origin is absent
+    const malformedRefererReq = new Request("http://localhost/api/auth/google/link", {
+      headers: { referer: "bad-url-string" },
+    });
+    assert.equal(isSameOriginRequest(malformedRefererReq), false);
+
+    // 8. Missing Origin and Referer rejected (fails closed)
+    const noOriginNoReferer = new Request("http://localhost/api/auth/google/link");
+    assert.equal(isSameOriginRequest(noOriginNoReferer), false);
+
+    // 9. A supplied malformed or cross-origin Origin is rejected even if Referer is trusted
+    const crossOriginWithTrustedReferer = new Request("http://localhost/api/auth/google/link", {
+      headers: {
+        origin: "https://evil.example",
+        referer: "https://rota-lovat-gamma.vercel.app/settings",
+      },
+    });
+    assert.equal(isSameOriginRequest(crossOriginWithTrustedReferer), false);
+
+    const malformedOriginWithTrustedReferer = new Request("http://localhost/api/auth/google/link", {
+      headers: {
+        origin: "invalid-url",
+        referer: "https://rota-lovat-gamma.vercel.app/settings",
+      },
+    });
+    assert.equal(isSameOriginRequest(malformedOriginWithTrustedReferer), false);
+
+    // 10. Untrusted Vercel preview origin rejected
+    const previewReq = new Request("https://rota-lovat-gamma.vercel.app/api/auth/google/link", {
+      headers: { origin: "https://rota-preview-123.vercel.app" },
+    });
+    assert.equal(isSameOriginRequest(previewReq), false);
+  });
+
+  it("strictly rejects localhost origins when NODE_ENV is set to production", () => {
+    const savedNodeEnv = process.env.NODE_ENV;
+    try {
+      process.env.NODE_ENV = "production";
+
+      const localhostInProd = new Request("https://rota-lovat-gamma.vercel.app/api/auth/google/link", {
+        headers: { origin: "http://localhost:3000" },
+      });
+      assert.equal(isSameOriginRequest(localhostInProd), false);
+
+      const canonicalInProd = new Request("https://rota-lovat-gamma.vercel.app/api/auth/google/link", {
+        headers: { origin: "https://rota-lovat-gamma.vercel.app" },
+      });
+      assert.equal(isSameOriginRequest(canonicalInProd), true);
+    } finally {
+      process.env.NODE_ENV = savedNodeEnv;
+    }
+  });
+
+  it("strictly rejects non-canonical Vercel preview origins configured via NEXT_PUBLIC_APP_URL in production", () => {
+    const savedNodeEnv = process.env.NODE_ENV;
+    const savedAppUrl = process.env.NEXT_PUBLIC_APP_URL;
+    try {
+      process.env.NODE_ENV = "production";
+      process.env.NEXT_PUBLIC_APP_URL = "https://rota-git-preview-feature.vercel.app";
+
+      const previewReq = new Request("https://rota-git-preview-feature.vercel.app/api/auth/google/link", {
+        headers: { origin: "https://rota-git-preview-feature.vercel.app" },
+      });
+      assert.equal(isSameOriginRequest(previewReq), false);
+
+      const previewRefererReq = new Request("https://rota-git-preview-feature.vercel.app/api/auth/google/link", {
+        headers: { referer: "https://rota-git-preview-feature.vercel.app/settings" },
+      });
+      assert.equal(isSameOriginRequest(previewRefererReq), false);
+
+      const canonicalInProd = new Request("https://rota-lovat-gamma.vercel.app/api/auth/google/link", {
+        headers: { origin: "https://rota-lovat-gamma.vercel.app" },
+      });
+      assert.equal(isSameOriginRequest(canonicalInProd), true);
+    } finally {
+      process.env.NODE_ENV = savedNodeEnv;
+      process.env.NEXT_PUBLIC_APP_URL = savedAppUrl;
+    }
+  });
+
+  it("includes explicitly configured NEXT_PUBLIC_APP_URL when valid", () => {
+    const savedAppUrl = process.env.NEXT_PUBLIC_APP_URL;
+    try {
+      process.env.NEXT_PUBLIC_APP_URL = "https://custom-domain.example.com";
+
+      const customReq = new Request("https://custom-domain.example.com/api/auth/google/link", {
+        headers: { origin: "https://custom-domain.example.com" },
+      });
+      assert.equal(isSameOriginRequest(customReq), true);
+
+      const crossReq = new Request("https://custom-domain.example.com/api/auth/google/link", {
+        headers: { origin: "https://other-domain.example.com" },
+      });
+      assert.equal(isSameOriginRequest(crossReq), false);
+    } finally {
+      process.env.NEXT_PUBLIC_APP_URL = savedAppUrl;
+    }
+  });
+
+  it("preserves explicitly configured trusted custom domains via NEXT_PUBLIC_APP_URL in production", () => {
+    const savedNodeEnv = process.env.NODE_ENV;
+    const savedAppUrl = process.env.NEXT_PUBLIC_APP_URL;
+    try {
+      process.env.NODE_ENV = "production";
+      process.env.NEXT_PUBLIC_APP_URL = "https://custom-domain.example.com";
+
+      const customReq = new Request("https://custom-domain.example.com/api/auth/google/link", {
+        headers: { origin: "https://custom-domain.example.com" },
+      });
+      assert.equal(isSameOriginRequest(customReq), true);
+
+      const untrustedPreviewReq = new Request("https://custom-domain.example.com/api/auth/google/link", {
+        headers: { origin: "https://arbitrary-preview.vercel.app" },
+      });
+      assert.equal(isSameOriginRequest(untrustedPreviewReq), false);
+
+      const canonicalReq = new Request("https://rota-lovat-gamma.vercel.app/api/auth/google/link", {
+        headers: { origin: "https://rota-lovat-gamma.vercel.app" },
+      });
+      assert.equal(isSameOriginRequest(canonicalReq), true);
+    } finally {
+      process.env.NODE_ENV = savedNodeEnv;
+      process.env.NEXT_PUBLIC_APP_URL = savedAppUrl;
+    }
+  });
+
+  it("strictly rejects non-canonical Vercel preview origins with trailing dots in production", () => {
+    const savedNodeEnv = process.env.NODE_ENV;
+    const savedAppUrl = process.env.NEXT_PUBLIC_APP_URL;
+    try {
+      process.env.NODE_ENV = "production";
+
+      // 1. Single trailing dot: https://rota-preview-feature.vercel.app.
+      process.env.NEXT_PUBLIC_APP_URL = "https://rota-preview-feature.vercel.app.";
+      const singleDotReq = new Request("https://rota-preview-feature.vercel.app./api/auth/google/link", {
+        headers: { origin: "https://rota-preview-feature.vercel.app." },
+      });
+      assert.equal(isSameOriginRequest(singleDotReq), false);
+
+      const singleDotRefererReq = new Request("https://rota-preview-feature.vercel.app./api/auth/google/link", {
+        headers: { referer: "https://rota-preview-feature.vercel.app./settings" },
+      });
+      assert.equal(isSameOriginRequest(singleDotRefererReq), false);
+
+      // 2. Multiple trailing dots: https://rota-preview-feature.vercel.app..
+      process.env.NEXT_PUBLIC_APP_URL = "https://rota-preview-feature.vercel.app..";
+      const doubleDotReq = new Request("https://rota-preview-feature.vercel.app../api/auth/google/link", {
+        headers: { origin: "https://rota-preview-feature.vercel.app.." },
+      });
+      assert.equal(isSameOriginRequest(doubleDotReq), false);
+
+      // Canonical production origin remains accepted
+      const canonicalReq = new Request("https://rota-lovat-gamma.vercel.app/api/auth/google/link", {
+        headers: { origin: "https://rota-lovat-gamma.vercel.app" },
+      });
+      assert.equal(isSameOriginRequest(canonicalReq), true);
+    } finally {
+      process.env.NODE_ENV = savedNodeEnv;
+      process.env.NEXT_PUBLIC_APP_URL = savedAppUrl;
+    }
+  });
+
+  it("strictly rejects localhost variants with trailing dots in production", () => {
+    const savedNodeEnv = process.env.NODE_ENV;
+    const savedAppUrl = process.env.NEXT_PUBLIC_APP_URL;
+    try {
+      process.env.NODE_ENV = "production";
+      process.env.NEXT_PUBLIC_APP_URL = "http://localhost.";
+
+      const localhostDotReq = new Request("https://rota-lovat-gamma.vercel.app/api/auth/google/link", {
+        headers: { origin: "http://localhost." },
+      });
+      assert.equal(isSameOriginRequest(localhostDotReq), false);
+
+      const localhostDotRefererReq = new Request("https://rota-lovat-gamma.vercel.app/api/auth/google/link", {
+        headers: { referer: "http://localhost./settings" },
+      });
+      assert.equal(isSameOriginRequest(localhostDotRefererReq), false);
+
+      const canonicalReq = new Request("https://rota-lovat-gamma.vercel.app/api/auth/google/link", {
+        headers: { origin: "https://rota-lovat-gamma.vercel.app" },
+      });
+      assert.equal(isSameOriginRequest(canonicalReq), true);
+    } finally {
+      process.env.NODE_ENV = savedNodeEnv;
+      process.env.NEXT_PUBLIC_APP_URL = savedAppUrl;
+    }
+  });
+
+  it("recognizes canonical production origin with trailing dot as canonical", () => {
+    const savedNodeEnv = process.env.NODE_ENV;
+    const savedAppUrl = process.env.NEXT_PUBLIC_APP_URL;
+    try {
+      process.env.NODE_ENV = "production";
+      process.env.NEXT_PUBLIC_APP_URL = "https://rota-lovat-gamma.vercel.app.";
+
+      const canonicalDotReq = new Request("https://rota-lovat-gamma.vercel.app./api/auth/google/link", {
+        headers: { origin: "https://rota-lovat-gamma.vercel.app." },
+      });
+      assert.equal(isSameOriginRequest(canonicalDotReq), true);
+
+      const canonicalStandardReq = new Request("https://rota-lovat-gamma.vercel.app/api/auth/google/link", {
+        headers: { origin: "https://rota-lovat-gamma.vercel.app" },
+      });
+      assert.equal(isSameOriginRequest(canonicalStandardReq), true);
+    } finally {
+      process.env.NODE_ENV = savedNodeEnv;
+      process.env.NEXT_PUBLIC_APP_URL = savedAppUrl;
+    }
+  });
+
+  it("rejects canonical hostname over HTTP or non-standard ports in production", () => {
+    const savedNodeEnv = process.env.NODE_ENV;
+    const savedAppUrl = process.env.NEXT_PUBLIC_APP_URL;
+    try {
+      process.env.NODE_ENV = "production";
+      delete process.env.NEXT_PUBLIC_APP_URL;
+
+      // 1. Canonical production HTTPS is accepted
+      const canonicalHttpsReq = new Request("https://rota-lovat-gamma.vercel.app/api/auth/google/link", {
+        headers: { origin: "https://rota-lovat-gamma.vercel.app" },
+      });
+      assert.equal(isSameOriginRequest(canonicalHttpsReq), true);
+
+      // Trailing-dot canonical HTTPS is accepted
+      const canonicalHttpsDotReq = new Request("https://rota-lovat-gamma.vercel.app/api/auth/google/link", {
+        headers: { origin: "https://rota-lovat-gamma.vercel.app." },
+      });
+      assert.equal(isSameOriginRequest(canonicalHttpsDotReq), true);
+
+      // 2. Canonical hostname over HTTP is rejected in production
+      const canonicalHttpReq = new Request("https://rota-lovat-gamma.vercel.app/api/auth/google/link", {
+        headers: { origin: "http://rota-lovat-gamma.vercel.app" },
+      });
+      assert.equal(isSameOriginRequest(canonicalHttpReq), false);
+
+      const canonicalHttpRefererReq = new Request("https://rota-lovat-gamma.vercel.app/api/auth/google/link", {
+        headers: { referer: "http://rota-lovat-gamma.vercel.app/settings" },
+      });
+      assert.equal(isSameOriginRequest(canonicalHttpRefererReq), false);
+
+      // Even if NEXT_PUBLIC_APP_URL is configured to HTTP canonical, it must be rejected in production
+      process.env.NEXT_PUBLIC_APP_URL = "http://rota-lovat-gamma.vercel.app";
+      assert.equal(isSameOriginRequest(canonicalHttpReq), false);
+
+      // 3. Canonical hostname over a non-standard port is rejected in production
+      process.env.NEXT_PUBLIC_APP_URL = "https://rota-lovat-gamma.vercel.app:8443";
+      const canonicalPortReq = new Request("https://rota-lovat-gamma.vercel.app/api/auth/google/link", {
+        headers: { origin: "https://rota-lovat-gamma.vercel.app:8443" },
+      });
+      assert.equal(isSameOriginRequest(canonicalPortReq), false);
+
+      const canonicalHttpPortReq = new Request("https://rota-lovat-gamma.vercel.app/api/auth/google/link", {
+        headers: { origin: "http://rota-lovat-gamma.vercel.app:8080" },
+      });
+      assert.equal(isSameOriginRequest(canonicalHttpPortReq), false);
+
+      // 4. Other Vercel preview domains remain rejected
+      process.env.NEXT_PUBLIC_APP_URL = "https://rota-preview-123.vercel.app";
+      const previewReq = new Request("https://rota-lovat-gamma.vercel.app/api/auth/google/link", {
+        headers: { origin: "https://rota-preview-123.vercel.app" },
+      });
+      assert.equal(isSameOriginRequest(previewReq), false);
+
+      // 5. Trusted custom production domains remain accepted
+      process.env.NEXT_PUBLIC_APP_URL = "https://custom-domain.example.com";
+      const customDomainReq = new Request("https://custom-domain.example.com/api/auth/google/link", {
+        headers: { origin: "https://custom-domain.example.com" },
+      });
+      assert.equal(isSameOriginRequest(customDomainReq), true);
+
+      // 6. Existing localhost and trailing-dot protections remain intact
+      process.env.NEXT_PUBLIC_APP_URL = "http://localhost.";
+      const localhostDotReq = new Request("https://rota-lovat-gamma.vercel.app/api/auth/google/link", {
+        headers: { origin: "http://localhost." },
+      });
+      assert.equal(isSameOriginRequest(localhostDotReq), false);
+    } finally {
+      process.env.NODE_ENV = savedNodeEnv;
+      process.env.NEXT_PUBLIC_APP_URL = savedAppUrl;
+    }
   });
 
   it("serializes and clears an HttpOnly OAuth state cookie scoped to Google routes", () => {

@@ -728,7 +728,7 @@ describe("Paystack Renewal Route — Vercel Cron GET & POST Scheduler Compatibil
       assert.equal(mockClient.chargeCalls.length, 1);
     });
 
-    it("preserves POST execution when authenticated with manager/owner session", async () => {
+    it("rejects POST request without valid CRON_SECRET even when manager/owner session is present (HTTP 401 and zero charges)", async () => {
       const auth = encryptAuthorizationCode("AUTH_post_mgr_1", VALID_KEY_HEX);
       const storage = new InMemoryBillingStorage([
         {
@@ -768,11 +768,11 @@ describe("Paystack Renewal Route — Vercel Cron GET & POST Scheduler Compatibil
         encryptionKey: VALID_KEY_HEX,
       });
 
-      assert.equal(res.status, 200);
+      assert.equal(res.status, 401);
       const data = await res.json();
-      assert.equal(data.success, true);
-      assert.equal(data.result.succeeded, 1);
-      assert.equal(mockClient.chargeCalls.length, 1);
+      assert.equal(data.error, "Unauthorized");
+      assert.equal(data.message, "Authorization required to trigger billing renewals.");
+      assert.equal(mockClient.chargeCalls.length, 0);
     });
 
     it("rejects POST request with invalid Bearer and no manager session with HTTP 401", async () => {

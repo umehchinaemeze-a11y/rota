@@ -3,8 +3,6 @@ import {
   runPaystackRenewalCycle,
   type RenewalEngineOptions,
 } from "../../../../../lib/paystack-renewal-engine.ts";
-import { getSessionUser } from "../../../../../lib/session.ts";
-import { isManagerRole } from "../../../../../lib/permissions.ts";
 
 export interface RenewalRouteOptions extends RenewalEngineOptions {
   cronSecret?: string;
@@ -38,11 +36,11 @@ export function isValidBearerToken(authHeader: string | null | undefined, expect
 
 /**
  * Shared handler for executing Paystack recurring renewal cycle via GET (Vercel Cron)
- * or POST (internal workflow / manual manager trigger).
+ * or POST (scheduled worker / authenticated administrative trigger).
  *
  * Security & Execution Invariants:
- * 1. Requires valid Authorization: Bearer <CRON_SECRET> for scheduled cron calls (GET or POST).
- * 2. On POST, also permits authenticated Manager/Owner session as an administrative fallback.
+ * 1. Requires valid Authorization: Bearer <CRON_SECRET> for all calls (GET or POST).
+ * 2. Ambient user and manager session cookies are strictly ignored.
  * 3. Fails closed with HTTP 401 on missing, empty, or mismatched credentials without executing renewals.
  * 4. Preserves database lease concurrency, idempotency, retry backoff, and payment provider isolation.
  * 5. Never leaks secrets, tokens, or customer credentials in response payloads or error messages.
@@ -58,20 +56,6 @@ export async function handleRenewalRequest(
 
     if (cronSecret && isValidBearerToken(authHeader, cronSecret)) {
       isAuthorized = true;
-    } else if (req.method === "POST") {
-      // Preserve POST compatibility for authenticated manager/owner session
-      const cookieHeader = req.headers.get("cookie");
-      if (options?.sessionUser !== undefined || (cookieHeader && cookieHeader.includes("rota_session"))) {
-        try {
-          const sessionUser =
-            options?.sessionUser !== undefined ? options.sessionUser : await getSessionUser();
-          if (sessionUser && (isManagerRole(sessionUser.role) || (sessionUser as any).teamRole === "Owner")) {
-            isAuthorized = true;
-          }
-        } catch {
-          // Session lookup failure falls through to unauthorized
-        }
-      }
     }
 
     if (!isAuthorized) {
@@ -106,8 +90,8 @@ export async function GET(req: Request) {
 }
 
 /**
- * POST endpoint preserving backward compatibility for internal workflows and admin triggers.
- * Requires Authorization: Bearer <CRON_SECRET> or authenticated manager session.
+ * POST endpoint for authenticated worker triggers and manual execution.
+ * Requires Authorization: Bearer <CRON_SECRET>.
  */
 export async function POST(req: Request) {
   return handleRenewalRequest(req);
