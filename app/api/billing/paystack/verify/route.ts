@@ -1,4 +1,5 @@
 import { getSessionUser } from "../../../../../lib/session.ts";
+import { isSameOriginRequest } from "../../../../../lib/oauth/safe-redirect.ts";
 import {
   PAYSTACK_PLANS,
   getPaystackPlan,
@@ -385,6 +386,10 @@ export async function handlePaystackVerify(
 }
 
 export async function POST(req: Request) {
+  if (!isSameOriginRequest(req)) {
+    return Response.json({ error: "Invalid request origin." }, { status: 403 });
+  }
+
   try {
     const sessionUser = await getSessionUser({ revalidateWithDb: true });
     let body: any = {};

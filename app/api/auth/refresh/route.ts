@@ -1,4 +1,5 @@
 import { getAuthSecret, serializeSessionCookie } from "../../../../lib/session.ts";
+import { isSameOriginRequest } from "../../../../lib/oauth/safe-redirect.ts";
 import {
   REFRESH_COOKIE_NAME,
   rotateAuthSession,
@@ -109,6 +110,9 @@ export async function handleRefresh(
 }
 
 export async function POST(request: Request) {
+  if (!isSameOriginRequest(request)) {
+    return Response.json({ error: "Invalid request origin." }, { status: 403 });
+  }
   return handleRefresh(request);
 }
 

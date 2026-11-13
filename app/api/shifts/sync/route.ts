@@ -11,8 +11,8 @@ let prodDepsPromise: Promise<Required<ShiftSyncRouteDependencies>> | null = null
 async function loadProductionDependencies(): Promise<Required<ShiftSyncRouteDependencies>> {
   if (!prodDepsPromise) {
     prodDepsPromise = Promise.all([
-      import("@/lib/db"),
-      import("@/lib/session"),
+      import("../../../../lib/db.ts"),
+      import("../../../../lib/session.ts"),
     ]).then(([{ sql }, { getSessionUser }]) => ({ sql, getSessionUser }));
   }
   return prodDepsPromise;

@@ -4,6 +4,7 @@ import {
   getAuthSecret,
   serializeSessionCookie,
 } from "../../../../lib/session.ts";
+import { isSameOriginRequest } from "../../../../lib/oauth/safe-redirect.ts";
 import { verifySessionToken } from "../../../../lib/auth.ts";
 import {
   REFRESH_COOKIE_NAME,
@@ -130,6 +131,11 @@ export async function handleLogout(
 }
 
 export async function POST(request: Request) {
+  const origin = request.headers.get("origin");
+  const referer = request.headers.get("referer");
+  if ((origin || referer) && !isSameOriginRequest(request)) {
+    return Response.json({ error: "Invalid request origin." }, { status: 403 });
+  }
   return handleLogout(request);
 }
 

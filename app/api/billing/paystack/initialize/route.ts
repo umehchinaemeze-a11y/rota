@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { getSessionUser } from "../../../../../lib/session.ts";
 import { isManagerRole } from "../../../../../lib/permissions.ts";
+import { isSameOriginRequest } from "../../../../../lib/oauth/safe-redirect.ts";
 import {
   PAYSTACK_PLANS,
   getPaystackPlan,
@@ -252,6 +253,10 @@ export async function POST(req: Request) {
     });
     if (rateLimitResp) {
       return rateLimitResp;
+    }
+
+    if (!isSameOriginRequest(req)) {
+      return Response.json({ error: "Invalid request origin." }, { status: 403 });
     }
 
     const sessionUser = await getSessionUser({ revalidateWithDb: true });

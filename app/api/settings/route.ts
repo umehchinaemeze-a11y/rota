@@ -1,4 +1,5 @@
 import type { SessionPayload } from "../../../lib/auth.ts";
+import { isSameOriginRequest } from "../../../lib/oauth/safe-redirect.ts";
 import {
   type UserSettings,
   getDefaultUserSettings,
@@ -29,8 +30,8 @@ let prodDepsPromise: Promise<ConcreteDependencies> | null = null;
 async function loadProductionDependencies(): Promise<ConcreteDependencies> {
   if (!prodDepsPromise) {
     prodDepsPromise = Promise.all([
-      import("@/lib/db"),
-      import("@/lib/session"),
+      import("../../../lib/db.ts"),
+      import("../../../lib/session.ts"),
     ]).then(([{ sql }, { getSessionUser }]) => ({ sql, getSessionUser }));
   }
   return prodDepsPromise;
@@ -414,11 +415,17 @@ export async function GET(request: Request): Promise<Response> {
 }
 
 export async function PUT(request: Request): Promise<Response> {
+  if (!isSameOriginRequest(request)) {
+    return Response.json({ error: "Invalid request origin." }, { status: 403 });
+  }
   const deps = await loadProductionDependencies();
   return handleUpdateSettings(request, deps);
 }
 
 export async function POST(request: Request): Promise<Response> {
+  if (!isSameOriginRequest(request)) {
+    return Response.json({ error: "Invalid request origin." }, { status: 403 });
+  }
   const deps = await loadProductionDependencies();
   return handleUpdateSettings(request, deps);
 }

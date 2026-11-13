@@ -21,6 +21,25 @@ import {
 } from "../lib/validation.ts";
 import { handleResetPassword } from "../app/api/auth/reset-password/route.ts";
 import { handleForgotPassword } from "../app/api/auth/forgot-password/route.ts";
+import { POST as handlePaystackCancelPost } from "../app/api/billing/paystack/cancel/route.ts";
+import { POST as handlePaystackInitPost } from "../app/api/billing/paystack/initialize/route.ts";
+import { POST as handlePaystackVerifyPost } from "../app/api/billing/paystack/verify/route.ts";
+import { POST as handleSwapApprovePost } from "../app/api/shifts/swaps/[id]/approve/route.ts";
+import { POST as handleSwapRejectPost } from "../app/api/shifts/swaps/[id]/reject/route.ts";
+import { POST as handleSwapsPost } from "../app/api/shifts/swaps/route.ts";
+import { POST as handleShiftsPost } from "../app/api/shifts/route.ts";
+import { PUT as handleShiftPut, DELETE as handleShiftDelete } from "../app/api/shifts/[id]/route.ts";
+import { POST as handleShiftRecoverPost } from "../app/api/shifts/recover/route.ts";
+import { POST as handleNotificationsPost } from "../app/api/notifications/route.ts";
+import { PUT as handleNotifPrefPut, POST as handleNotifPrefPost } from "../app/api/notifications/preferences/route.ts";
+import { POST as handleNotifTokensPost, DELETE as handleNotifTokensDelete } from "../app/api/notifications/tokens/route.ts";
+import { PUT as handleSettingsPut, POST as handleSettingsPost } from "../app/api/settings/route.ts";
+import { POST as handleInvitationsPost } from "../app/api/teams/invitations/route.ts";
+import { POST as handleAcceptInvitationPost } from "../app/api/teams/invitations/accept/route.ts";
+import { POST as handleActivityPost } from "../app/api/activity/route.ts";
+import { POST as handleRefreshPost } from "../app/api/auth/refresh/route.ts";
+import { POST as handleLogoutPost } from "../app/api/auth/logout/route.ts";
+import { POST as handleLogoutAllPost } from "../app/api/auth/logout-all/route.ts";
 
 const TEST_SECRET = "super-secret-auth-key-at-least-32-characters-long!";
 
@@ -399,6 +418,233 @@ describe("Password Reset API Route Handler (handleResetPassword)", () => {
     assert.equal(throttledRes.status, 429);
     assert.ok(throttledRes.headers.get("Retry-After"));
     assert.equal(throttledRes.headers.get("X-RateLimit-Limit"), "5");
+  });
+});
+
+describe("State-Changing API Routes — CSRF & Same-Origin Enforcement", () => {
+  const CANONICAL_ORIGIN = "https://rota-lovat-gamma.vercel.app";
+  const EVIL_ORIGIN = "https://evil.example";
+
+  const dummyContext = { params: Promise.resolve({ id: "1" }) };
+
+  const endpointsToTest = [
+    {
+      name: "POST /api/billing/paystack/cancel",
+      handler: (req) => handlePaystackCancelPost(req),
+      url: "https://rota-lovat-gamma.vercel.app/api/billing/paystack/cancel",
+      method: "POST",
+    },
+    {
+      name: "POST /api/billing/paystack/initialize",
+      handler: (req) => handlePaystackInitPost(req),
+      url: "https://rota-lovat-gamma.vercel.app/api/billing/paystack/initialize",
+      method: "POST",
+    },
+    {
+      name: "POST /api/billing/paystack/verify",
+      handler: (req) => handlePaystackVerifyPost(req),
+      url: "https://rota-lovat-gamma.vercel.app/api/billing/paystack/verify",
+      method: "POST",
+    },
+    {
+      name: "POST /api/shifts/swaps/1/approve",
+      handler: (req) => handleSwapApprovePost(req, dummyContext),
+      url: "https://rota-lovat-gamma.vercel.app/api/shifts/swaps/1/approve",
+      method: "POST",
+    },
+    {
+      name: "POST /api/shifts/swaps/1/reject",
+      handler: (req) => handleSwapRejectPost(req, dummyContext),
+      url: "https://rota-lovat-gamma.vercel.app/api/shifts/swaps/1/reject",
+      method: "POST",
+    },
+    {
+      name: "POST /api/shifts/swaps",
+      handler: (req) => handleSwapsPost(req),
+      url: "https://rota-lovat-gamma.vercel.app/api/shifts/swaps",
+      method: "POST",
+    },
+    {
+      name: "POST /api/shifts",
+      handler: (req) => handleShiftsPost(req),
+      url: "https://rota-lovat-gamma.vercel.app/api/shifts",
+      method: "POST",
+    },
+    {
+      name: "PUT /api/shifts/1",
+      handler: (req) => handleShiftPut(req, dummyContext),
+      url: "https://rota-lovat-gamma.vercel.app/api/shifts/1",
+      method: "PUT",
+    },
+    {
+      name: "DELETE /api/shifts/1",
+      handler: (req) => handleShiftDelete(req, dummyContext),
+      url: "https://rota-lovat-gamma.vercel.app/api/shifts/1",
+      method: "DELETE",
+    },
+    {
+      name: "POST /api/shifts/recover",
+      handler: (req) => handleShiftRecoverPost(req),
+      url: "https://rota-lovat-gamma.vercel.app/api/shifts/recover",
+      method: "POST",
+    },
+    {
+      name: "POST /api/notifications",
+      handler: (req) => handleNotificationsPost(req),
+      url: "https://rota-lovat-gamma.vercel.app/api/notifications",
+      method: "POST",
+    },
+    {
+      name: "PUT /api/notifications/preferences",
+      handler: (req) => handleNotifPrefPut(req),
+      url: "https://rota-lovat-gamma.vercel.app/api/notifications/preferences",
+      method: "PUT",
+    },
+    {
+      name: "POST /api/notifications/preferences",
+      handler: (req) => handleNotifPrefPost(req),
+      url: "https://rota-lovat-gamma.vercel.app/api/notifications/preferences",
+      method: "POST",
+    },
+    {
+      name: "POST /api/notifications/tokens",
+      handler: (req) => handleNotifTokensPost(req),
+      url: "https://rota-lovat-gamma.vercel.app/api/notifications/tokens",
+      method: "POST",
+    },
+    {
+      name: "DELETE /api/notifications/tokens",
+      handler: (req) => handleNotifTokensDelete(req),
+      url: "https://rota-lovat-gamma.vercel.app/api/notifications/tokens",
+      method: "DELETE",
+    },
+    {
+      name: "PUT /api/settings",
+      handler: (req) => handleSettingsPut(req),
+      url: "https://rota-lovat-gamma.vercel.app/api/settings",
+      method: "PUT",
+    },
+    {
+      name: "POST /api/settings",
+      handler: (req) => handleSettingsPost(req),
+      url: "https://rota-lovat-gamma.vercel.app/api/settings",
+      method: "POST",
+    },
+    {
+      name: "POST /api/teams/invitations",
+      handler: (req) => handleInvitationsPost(req),
+      url: "https://rota-lovat-gamma.vercel.app/api/teams/invitations",
+      method: "POST",
+    },
+    {
+      name: "POST /api/teams/invitations/accept",
+      handler: (req) => handleAcceptInvitationPost(req),
+      url: "https://rota-lovat-gamma.vercel.app/api/teams/invitations/accept",
+      method: "POST",
+    },
+    {
+      name: "POST /api/activity",
+      handler: (req) => handleActivityPost(req),
+      url: "https://rota-lovat-gamma.vercel.app/api/activity",
+      method: "POST",
+    },
+    {
+      name: "POST /api/auth/refresh",
+      handler: (req) => handleRefreshPost(req),
+      url: "https://rota-lovat-gamma.vercel.app/api/auth/refresh",
+      method: "POST",
+    },
+    {
+      name: "POST /api/auth/logout-all",
+      handler: (req) => handleLogoutAllPost(req),
+      url: "https://rota-lovat-gamma.vercel.app/api/auth/logout-all",
+      method: "POST",
+    },
+  ];
+
+  for (const ep of endpointsToTest) {
+    it(`${ep.name} rejects cross-origin requests with HTTP 403 Forbidden`, async () => {
+      const req = new Request(ep.url, {
+        method: ep.method,
+        headers: {
+          Origin: EVIL_ORIGIN,
+          "Content-Type": "application/json",
+        },
+        body: ep.method !== "DELETE" && ep.method !== "GET" ? "{}" : undefined,
+      });
+
+      const res = await ep.handler(req);
+      assert.equal(res.status, 403);
+      const json = await res.json();
+      assert.equal(json.error, "Invalid request origin.");
+    });
+
+    it(`${ep.name} rejects missing Origin/Referer requests with HTTP 403 Forbidden`, async () => {
+      const req = new Request(ep.url, {
+        method: ep.method,
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: ep.method !== "DELETE" && ep.method !== "GET" ? "{}" : undefined,
+      });
+
+      const res = await ep.handler(req);
+      assert.equal(res.status, 403);
+      const json = await res.json();
+      assert.equal(json.error, "Invalid request origin.");
+    });
+
+    it(`${ep.name} accepts canonical origin requests`, async () => {
+      const req = new Request(ep.url, {
+        method: ep.method,
+        headers: {
+          Origin: CANONICAL_ORIGIN,
+          "Content-Type": "application/json",
+        },
+        body: ep.method !== "DELETE" && ep.method !== "GET" ? "{}" : undefined,
+      });
+
+      const res = await ep.handler(req);
+      assert.notEqual(res.status, 403, `Must not be blocked by origin validation on ${ep.name}`);
+    });
+  }
+
+  describe("POST /api/auth/logout Origin Security & Client Preservation", () => {
+    it("rejects cross-origin logout attempts with HTTP 403", async () => {
+      const req = new Request("https://rota-lovat-gamma.vercel.app/api/auth/logout", {
+        method: "POST",
+        headers: {
+          Origin: EVIL_ORIGIN,
+        },
+      });
+
+      const res = await handleLogoutPost(req);
+      assert.equal(res.status, 403);
+      const json = await res.json();
+      assert.equal(json.error, "Invalid request origin.");
+    });
+
+    it("accepts canonical origin logout requests", async () => {
+      const req = new Request("https://rota-lovat-gamma.vercel.app/api/auth/logout", {
+        method: "POST",
+        headers: {
+          Origin: CANONICAL_ORIGIN,
+        },
+      });
+
+      const res = await handleLogoutPost(req);
+      assert.equal(res.status, 200);
+    });
+
+    it("preserves native Expo/React Native mobile logout requests without Origin/Referer", async () => {
+      const req = new Request("https://rota-lovat-gamma.vercel.app/api/auth/logout", {
+        method: "POST",
+        headers: {},
+      });
+
+      const res = await handleLogoutPost(req);
+      assert.equal(res.status, 200);
+    });
   });
 });
 

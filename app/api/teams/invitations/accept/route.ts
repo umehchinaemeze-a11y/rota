@@ -2,6 +2,7 @@ import type { SessionPayload } from "../../../../../lib/auth.ts";
 import { createSessionToken } from "../../../../../lib/auth.ts";
 import { getAuthSecret, serializeSessionCookie } from "../../../../../lib/session.ts";
 import { verifyInvitationToken } from "../../../../../lib/invitations.ts";
+import { isSameOriginRequest } from "../../../../../lib/oauth/safe-redirect.ts";
 import {
   evaluateSeatCapacity,
   validateMemberAddition,
@@ -256,5 +257,8 @@ export async function handleAcceptInvitation(
 }
 
 export async function POST(request: Request) {
+  if (!isSameOriginRequest(request)) {
+    return Response.json({ error: "Invalid request origin." }, { status: 403 });
+  }
   return handleAcceptInvitation(request);
 }

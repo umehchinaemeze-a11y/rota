@@ -1,6 +1,7 @@
 import { canManageTeamShiftRecord, isManagerRole } from "../../../../lib/permissions.ts";
 import type { SessionPayload } from "../../../../lib/auth.ts";
 import { invalidateTeamCache, type CacheStore } from "../../../../lib/cache.ts";
+import { isSameOriginRequest } from "../../../../lib/oauth/safe-redirect.ts";
 
 export type RouteContext = {
   params: Promise<{ id: string }>;
@@ -24,8 +25,8 @@ let prodDepsPromise: Promise<ProductionDependencies> | null = null;
 async function loadProductionDependencies(): Promise<ProductionDependencies> {
   if (!prodDepsPromise) {
     prodDepsPromise = Promise.all([
-      import("@/lib/db"),
-      import("@/lib/session"),
+      import("../../../../lib/db.ts"),
+      import("../../../../lib/session.ts"),
       import("../../../../lib/notifications-dispatch.ts"),
     ]).then(([{ sql }, { getSessionUser }, { dispatchNotification }]) => ({
       sql,
@@ -355,6 +356,9 @@ export async function PUT(
   request: Request,
   context: RouteContext
 ): Promise<Response> {
+  if (!isSameOriginRequest(request)) {
+    return Response.json({ error: "Invalid request origin." }, { status: 403 });
+  }
   const deps = await loadProductionDependencies();
   return handlePutShift(request, context, deps);
 }
@@ -470,6 +474,9 @@ export async function DELETE(
   request: Request,
   context: RouteContext
 ): Promise<Response> {
+  if (!isSameOriginRequest(request)) {
+    return Response.json({ error: "Invalid request origin." }, { status: 403 });
+  }
   const deps = await loadProductionDependencies();
   return handleDeleteShift(request, context, deps);
 }

@@ -1,4 +1,5 @@
 import type { SessionPayload } from "../../../../lib/auth.ts";
+import { isSameOriginRequest } from "../../../../lib/oauth/safe-redirect.ts";
 import {
   getRecoverableShiftsForUser,
   recoverLegacyShifts,
@@ -174,6 +175,9 @@ export async function handlePostRecoverShifts(
 }
 
 export async function POST(request: Request): Promise<Response> {
+  if (!isSameOriginRequest(request)) {
+    return Response.json({ error: "Invalid request origin." }, { status: 403 });
+  }
   const deps = await loadProductionDependencies();
   return handlePostRecoverShifts(request, deps);
 }

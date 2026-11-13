@@ -1,5 +1,6 @@
 import { getSessionUser } from "../../../../../lib/session.ts";
 import { isManagerRole } from "../../../../../lib/permissions.ts";
+import { isSameOriginRequest } from "../../../../../lib/oauth/safe-redirect.ts";
 import {
   createDefaultBillingStorage,
   type BillingStorageInterface,
@@ -83,7 +84,11 @@ export async function handleCancelPaystackSubscription(
     };
 }
 
-export async function POST() {
+export async function POST(request: Request) {
+  if (!isSameOriginRequest(request)) {
+    return Response.json({ error: "Invalid request origin." }, { status: 403 });
+  }
+
   try {
     const sessionUser = await getSessionUser({ revalidateWithDb: true });
     const { status, body } = await handleCancelPaystackSubscription(sessionUser);

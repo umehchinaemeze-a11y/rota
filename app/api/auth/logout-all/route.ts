@@ -1,4 +1,5 @@
 import { handleLogout, type LogoutRouteDependencies } from "../logout/route.ts";
+import { isSameOriginRequest } from "../../../../lib/oauth/safe-redirect.ts";
 
 export async function handleLogoutAll(
   request: Request,
@@ -14,6 +15,9 @@ export async function handleLogoutAll(
 }
 
 export async function POST(request: Request): Promise<Response> {
+  if (!isSameOriginRequest(request)) {
+    return Response.json({ error: "Invalid request origin." }, { status: 403 });
+  }
   return handleLogoutAll(request);
 }
 

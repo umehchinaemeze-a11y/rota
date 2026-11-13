@@ -1,5 +1,6 @@
 import type { SessionPayload } from "../../../../lib/auth.ts";
 import { getAuthSecret } from "../../../../lib/session.ts";
+import { isSameOriginRequest } from "../../../../lib/oauth/safe-redirect.ts";
 import {
   createInvitationToken,
   verifyInvitationToken,
@@ -267,6 +268,9 @@ export async function handleVerifyInvitation(
 }
 
 export async function POST(request: Request) {
+  if (!isSameOriginRequest(request)) {
+    return Response.json({ error: "Invalid request origin." }, { status: 403 });
+  }
   return handleCreateInvitation(request);
 }
 

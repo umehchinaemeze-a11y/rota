@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getSessionUser } from "@/lib/session";
+import { getSessionUser } from "../../../../lib/session.ts";
 
 export async function GET(request: Request) {
   try {
@@ -12,7 +12,7 @@ export async function GET(request: Request) {
       );
     }
 
-    const { sql } = await import("@/lib/db");
+    const { sql } = await import("../../../../lib/db.ts");
     let hasPassword = false;
     let googleLinked = false;
 

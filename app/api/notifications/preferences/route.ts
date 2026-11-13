@@ -1,4 +1,5 @@
 import type { SessionPayload } from "../../../../lib/auth.ts";
+import { isSameOriginRequest } from "../../../../lib/oauth/safe-redirect.ts";
 import {
   type UserNotificationPreferences,
   getDefaultNotificationPreferences,
@@ -17,8 +18,8 @@ let prodDepsPromise: Promise<Required<NotificationPreferencesDependencies>> | nu
 async function loadProductionDependencies(): Promise<Required<NotificationPreferencesDependencies>> {
   if (!prodDepsPromise) {
     prodDepsPromise = Promise.all([
-      import("@/lib/db"),
-      import("@/lib/session"),
+      import("../../../../lib/db.ts"),
+      import("../../../../lib/session.ts"),
     ]).then(([{ sql }, { getSessionUser }]) => ({ sql, getSessionUser }));
   }
   return prodDepsPromise;
@@ -274,11 +275,17 @@ export async function GET(request: Request): Promise<Response> {
 }
 
 export async function PUT(request: Request): Promise<Response> {
+  if (!isSameOriginRequest(request)) {
+    return Response.json({ error: "Invalid request origin." }, { status: 403 });
+  }
   const deps = await loadProductionDependencies();
   return handleUpdatePreferences(request, deps);
 }
 
 export async function POST(request: Request): Promise<Response> {
+  if (!isSameOriginRequest(request)) {
+    return Response.json({ error: "Invalid request origin." }, { status: 403 });
+  }
   const deps = await loadProductionDependencies();
   return handleUpdatePreferences(request, deps);
 }

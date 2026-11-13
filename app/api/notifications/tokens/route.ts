@@ -1,4 +1,5 @@
 import type { SessionPayload } from "../../../../lib/auth.ts";
+import { isSameOriginRequest } from "../../../../lib/oauth/safe-redirect.ts";
 import {
   type DevicePlatform,
   ensureNotificationsTables,
@@ -14,8 +15,8 @@ let prodDepsPromise: Promise<Required<NotificationTokensDependencies>> | null = 
 async function loadProductionDependencies(): Promise<Required<NotificationTokensDependencies>> {
   if (!prodDepsPromise) {
     prodDepsPromise = Promise.all([
-      import("@/lib/db"),
-      import("@/lib/session"),
+      import("../../../../lib/db.ts"),
+      import("../../../../lib/session.ts"),
     ]).then(([{ sql }, { getSessionUser }]) => ({ sql, getSessionUser }));
   }
   return prodDepsPromise;
@@ -204,11 +205,17 @@ export async function handleDeleteToken(
 }
 
 export async function POST(request: Request): Promise<Response> {
+  if (!isSameOriginRequest(request)) {
+    return Response.json({ error: "Invalid request origin." }, { status: 403 });
+  }
   const deps = await loadProductionDependencies();
   return handleRegisterToken(request, deps);
 }
 
 export async function DELETE(request: Request): Promise<Response> {
+  if (!isSameOriginRequest(request)) {
+    return Response.json({ error: "Invalid request origin." }, { status: 403 });
+  }
   const deps = await loadProductionDependencies();
   return handleDeleteToken(request, deps);
 }

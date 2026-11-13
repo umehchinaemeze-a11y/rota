@@ -1,4 +1,5 @@
 import { getSessionUser } from "../../../lib/session.ts";
+import { isSameOriginRequest } from "../../../lib/oauth/safe-redirect.ts";
 import {
   getActivityFeed,
   recordActivityEvent,
@@ -190,5 +191,8 @@ export async function GET(request: Request): Promise<Response> {
 }
 
 export async function POST(request: Request): Promise<Response> {
+  if (!isSameOriginRequest(request)) {
+    return Response.json({ error: "Invalid request origin." }, { status: 403 });
+  }
   return handlePostActivity(request);
 }

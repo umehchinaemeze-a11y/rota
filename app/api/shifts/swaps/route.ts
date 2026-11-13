@@ -1,5 +1,6 @@
 import type { SessionPayload } from "../../../../lib/auth.ts";
 import { isManagerRole } from "../../../../lib/permissions.ts";
+import { isSameOriginRequest } from "../../../../lib/oauth/safe-redirect.ts";
 import {
   validateSwapRequest,
   ensureShiftSwapsTable,
@@ -16,8 +17,8 @@ let prodDepsPromise: Promise<Required<ShiftSwapRouteDependencies>> | null = null
 async function loadProductionDependencies(): Promise<Required<ShiftSwapRouteDependencies>> {
   if (!prodDepsPromise) {
     prodDepsPromise = Promise.all([
-      import("@/lib/db"),
-      import("@/lib/session"),
+      import("../../../../lib/db.ts"),
+      import("../../../../lib/session.ts"),
     ]).then(([{ sql }, { getSessionUser }]) => ({ sql, getSessionUser }));
   }
   return prodDepsPromise;
@@ -347,6 +348,9 @@ export async function GET(request: Request): Promise<Response> {
 }
 
 export async function POST(request: Request): Promise<Response> {
+  if (!isSameOriginRequest(request)) {
+    return Response.json({ error: "Invalid request origin." }, { status: 403 });
+  }
   const deps = await loadProductionDependencies();
   return handlePostSwap(request, deps);
 }

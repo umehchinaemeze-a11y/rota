@@ -1,5 +1,6 @@
 import { isManagerRole } from "../../../lib/permissions.ts";
 import type { SessionPayload } from "../../../lib/auth.ts";
+import { isSameOriginRequest } from "../../../lib/oauth/safe-redirect.ts";
 import {
   getCachedShiftSchedule,
   invalidateTeamCache,
@@ -25,8 +26,8 @@ let prodDepsPromise: Promise<ProductionDependencies> | null = null;
 async function loadProductionDependencies(): Promise<ProductionDependencies> {
   if (!prodDepsPromise) {
     prodDepsPromise = Promise.all([
-      import("@/lib/db"),
-      import("@/lib/session"),
+      import("../../../lib/db.ts"),
+      import("../../../lib/session.ts"),
       import("../../../lib/notifications-dispatch.ts"),
     ]).then(([{ sql }, { getSessionUser }, { dispatchNotification }]) => ({
       sql,
@@ -321,6 +322,9 @@ export async function handlePostShift(
 }
 
 export async function POST(request: Request): Promise<Response> {
+  if (!isSameOriginRequest(request)) {
+    return Response.json({ error: "Invalid request origin." }, { status: 403 });
+  }
   const deps = await loadProductionDependencies();
   return handlePostShift(request, deps);
 }

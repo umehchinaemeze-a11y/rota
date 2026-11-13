@@ -1,4 +1,5 @@
 import type { SessionPayload } from "../../../lib/auth.ts";
+import { isSameOriginRequest } from "../../../lib/oauth/safe-redirect.ts";
 import {
   type NotificationRecord,
   ensureNotificationsTables,
@@ -14,8 +15,8 @@ let prodDepsPromise: Promise<Required<NotificationsRouteDependencies>> | null = 
 async function loadProductionDependencies(): Promise<Required<NotificationsRouteDependencies>> {
   if (!prodDepsPromise) {
     prodDepsPromise = Promise.all([
-      import("@/lib/db"),
-      import("@/lib/session"),
+      import("../../../lib/db.ts"),
+      import("../../../lib/session.ts"),
     ]).then(([{ sql }, { getSessionUser }]) => ({ sql, getSessionUser }));
   }
   return prodDepsPromise;
@@ -177,6 +178,9 @@ export async function GET(request: Request): Promise<Response> {
 }
 
 export async function POST(request: Request): Promise<Response> {
+  if (!isSameOriginRequest(request)) {
+    return Response.json({ error: "Invalid request origin." }, { status: 403 });
+  }
   const deps = await loadProductionDependencies();
   return handleMarkNotificationsRead(request, deps);
 }
